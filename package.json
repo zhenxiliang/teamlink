@@ -2,7 +2,7 @@
   "name": "teamlink",
   "version": "0.1.0",
   "private": true,
-  "description": "团队成员各自的 AI 之间互相传话：问对方的 AI，把只有你知道的改动和决定告诉需要的人",
+  "description": "给多人团队用的：每个人用自己的 AI，teamlink 让这些 AI 互相传话：问对方的 AI，把只有你知道的改动和决定告诉需要的人",
   "license": "MIT",
   "type": "module",
   "bin": {
