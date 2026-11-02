@@ -148,7 +148,7 @@ function restoreClaimed(dir: string): void {
 /**
  * 按存进去的先后补发，最晚到 deadline 为止（每个请求的超时取剩下的时间）。按状态码处理：
  * 2xx 删掉，点名的人不在线时记一条“对方不在线”；400、403、404、413、422 和坏掉的文件移进 failed/，记“被退回”；
- * 401、426、429、5xx 留着，本轮停止（后面的也不发，顺序不乱），不告诉 AI；连不上也留着、本轮停止，由调用方设退避
+ * 401、426、429、5xx 留着，本轮停止（后面的也不发，顺序不乱），一直卡着的由 noteRound 记账、告诉 AI；连不上也留着、本轮停止，由调用方设退避
  * （这一轮服务器已经回过话、后面的请求才超时的，是补发的时间用完了：本轮停止，不设退避，主请求照发）。
  */
 export async function flushOutbox(root: string, cfg: RepoConfig, identity: Identity, deadline: number, stateDir?: string): Promise<FlushResult> {

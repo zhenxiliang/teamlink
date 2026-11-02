@@ -954,7 +954,7 @@ test('发件箱：hook 补发；旧 payload（interface_change，带 branch、ba
   assert.match(rest.join('\n\n'), /^<team-notices-[0-9a-f]{8}>\n[\s\S]*又一条给 alice 的/);
 });
 
-test('发件箱：429 和 5xx 一样留着，本轮停止（后面的也先不发，顺序不乱），不告诉 AI；放开以后按原来的顺序补发', async () => {
+test('发件箱：429 和偶尔一次的 5xx 一样留着，本轮停止（后面的也先不发，顺序不乱），不告诉 AI；放开以后按原来的顺序补发', async () => {
   fresh();
   const { alice, bob } = devs;
   await hook(alice, 'session-start', 'codex', { session_id: 'alice-429' });
