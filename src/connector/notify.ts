@@ -1,15 +1,18 @@
 // notify、ask、reply：先当场校验（--to、成员名、长度、声明格式），不对直接报错、不存发件箱；
 // hook 的退避标记有效时、或者发件箱里还有待补发的（又有会话开着、马上有 hook 来补发）时直接存进发件箱；
 // 否则直连发送（超时 8 秒），连不上再存发件箱，由 hook 补发。
+// ask --wait：提问发出去、对方又在线时，在这条命令里等回答，到了直接打印（见 waitForAnswer）。
 
 import { randomUUID } from 'node:crypto';
-import type { Claim, NoticeType, SendResponse } from '../shared/protocol.ts';
+import type { Claim, NoticeType, NoticeVia, SendResponse, TakeAnswersResponse } from '../shared/protocol.ts';
 import { claimError, MAX_CLAIMS, MAX_SUMMARY_CHARS, TOOLS } from '../shared/protocol.ts';
+import { normalizeText } from '../shared/render.ts';
 import { call, ClientError, NetworkError } from './client.ts';
 import type { Identity, RepoConfig } from './config.ts';
 import { installedTools } from './install.ts';
+import { originOf } from './origin.ts';
 import { OUTBOX_DIR, outboxCounts, reasonText, REJECTED, saveToOutbox, sentText } from './outbox.ts';
-import { markAnswer, type AnswerState } from './received.ts';
+import { markAnswer, saveReceived, type AnswerState } from './received.ts';
 import { backoffActive, lastHookRun, loadLastSession, loadMembers, openSessions, stateDirOf, stuckReason } from './state.ts';
 
 export interface Outgoing {
@@ -20,6 +23,14 @@ export interface Outgoing {
   to: string[];
   /** 回答哪一条提问。 */
   replyTo?: string;
+  /** 谁写的；不写就按运行环境判断（AI 会话里发的，还是本人在终端里写的）。 */
+  via?: NoticeVia;
+}
+
+/** 发送的结果：打印给 AI 的回执；直连发出去了的话带上服务器的响应（暂存进发件箱时为 null）。 */
+export interface Sent {
+  text: string;
+  response: SendResponse | null;
 }
 
 const SEND_TIMEOUT_MS = 8000;
@@ -91,6 +102,11 @@ function mark(root: string, input: Outgoing, state: AnswerState, summary: string
 
 /** 发一条消息，返回打印给 AI 的回执。格式不对、名字不对都当场抛错，不存发件箱。 */
 export async function sendNotice(root: string, cfg: RepoConfig, identity: Identity, input: Outgoing): Promise<string> {
+  return (await send(root, cfg, identity, input)).text;
+}
+
+/** 同 sendNotice，另外带回服务器的响应（ask --wait 要用通知号和对方在不在线）。 */
+export async function send(root: string, cfg: RepoConfig, identity: Identity, input: Outgoing): Promise<Sent> {
   const summary = input.summary.trimEnd();
   check(input, summary);
   const to = input.type === 'answer' ? [] : recipients(root, cfg, identity, input.to);
@@ -103,18 +119,18 @@ export async function sendNotice(root: string, cfg: RepoConfig, identity: Identi
     summary,
     claims: input.claims,
     ...(input.type === 'answer' ? { replyTo: input.replyTo } : { to }),
+    // 谁写的：存进发件箱的也带着，补发时还是当时判断的结果
+    via: input.via ?? originOf(),
     // 直连超时、改存发件箱后再补发时，服务器可能其实已经收到了：凭这个编号去重
     clientId: randomUUID(),
   };
   const dir = stateDirOf(root);
   const stuck = stuckReason(dir);
-  const queue = (behind = false) => {
+  const queue = (behind = false): Sent => {
     saveToOutbox(root, payload);
     mark(root, input, 'queued', summary);
-    if (behind) return BEHIND_TEXT;
-    if (installedTools(root).length === 0) return NO_HOOK_TEXT;
-    if (stuck) return stuckText(stuck);
-    return hooksRunning(dir) ? QUEUED_TEXT : IDLE_HOOK_TEXT;
+    const text = behind ? BEHIND_TEXT : installedTools(root).length === 0 ? NO_HOOK_TEXT : stuck ? stuckText(stuck) : hooksRunning(dir) ? QUEUED_TEXT : IDLE_HOOK_TEXT;
+    return { text, response: null };
   };
   // hook 刚连不上服务器（退避中）：直接存，不用再等 8 秒超时
   if (backoffActive(dir)) return queue();
@@ -130,5 +146,66 @@ export async function sendNotice(root: string, cfg: RepoConfig, identity: Identi
     throw e;
   }
   mark(root, input, 'sent', summary);
-  return sentText(input.type, res);
+  return { text: sentText(input.type, res), response: res };
+}
+
+// —— ask --wait ——
+
+/** --wait 不写秒数时等这么久：比 Claude Code 给一条命令的默认时限（2 分钟）短。 */
+export const WAIT_DEFAULT_S = 90;
+export const WAIT_MAX_S = 3600;
+/** 轮询间隔：一开始半秒一次，逐步放慢到 3 秒一次。 */
+const POLL_FIRST_MS = 500;
+const POLL_MAX_MS = 3000;
+
+const LATER = '回答到了会自动转给你，先做不依赖这条信息的部分。';
+
+/** 等回答的结果：要打印的文字；等到了回答的话，ids 是这些回答的通知号（打印以后要向服务器确认）。 */
+export interface Waited {
+  text: string;
+  ids: string[];
+}
+
+/**
+ * 等某条提问的回答，最多 waitMs。回答到了就返回渲染好的文字和通知号，并存进 received.md；调用方打印以后用 confirmAnswers 确认。
+ * 等不到（超时、对方下线、连不上服务器、服务器是旧版）返回一句说明：回答之后照常由 hook 送到，什么都不会丢。
+ */
+export async function waitForAnswer(root: string, cfg: RepoConfig, identity: Identity, questionId: string, who: string, waitMs: number): Promise<Waited> {
+  const body = { repoId: cfg.repoId, question: questionId };
+  const none = (text: string): Waited => ({ text, ids: [] });
+  const name = normalizeText(who, true);
+  const deadline = Date.now() + waitMs;
+  let interval = POLL_FIRST_MS;
+  for (;;) {
+    let res: TakeAnswersResponse;
+    try {
+      res = await call<TakeAnswersResponse>(cfg.server, identity, 'POST', '/api/v2/answers/take', body, SEND_TIMEOUT_MS);
+    } catch (e) {
+      if (e instanceof NetworkError) return none(`等回答时连不上服务器，不等了：${LATER}`);
+      if (e instanceof ClientError && e.status === 404) return none(`服务器还不支持 --wait（请管理员升级服务器）：${LATER}`);
+      throw e;
+    }
+    if (Array.isArray(res.ids) && res.ids.length > 0 && res.text) {
+      try {
+        saveReceived(root, res.text, res.ids.length);
+      } catch {
+        // 存档只是方便回看，写不了就算了
+      }
+      return { text: res.text, ids: res.ids };
+    }
+    if (res.online === false) return none(`${name} 下线了，不等了：他下次开工时会看到提问。${LATER}`);
+    const left = deadline - Date.now();
+    if (left <= 0) return none(`等了 ${Math.round(waitMs / 1000)} 秒，${name} 还没回答。${LATER}`);
+    await new Promise((ok) => setTimeout(ok, Math.min(interval, left)));
+    interval = Math.min(POLL_MAX_MS, Math.round(interval * 1.5));
+  }
+}
+
+/** --wait 拿到的回答打印出去以后，向服务器确认。确认不了也不要紧：服务器没收到确认，hook 会再送一次。 */
+export async function confirmAnswers(cfg: RepoConfig, identity: Identity, ids: string[]): Promise<void> {
+  try {
+    await call(cfg.server, identity, 'POST', '/api/v2/acks', { acks: ids }, 3000);
+  } catch {
+    // 见上
+  }
 }

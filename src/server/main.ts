@@ -1,12 +1,14 @@
 // 服务器入口：`teamlink-server init | add-repo | invite | policy | start`。
 
-import { mkdirSync } from 'node:fs';
+import { X509Certificate } from 'node:crypto';
+import { mkdirSync, readFileSync } from 'node:fs';
+import type { Server as TlsServer } from 'node:https';
 import type { AddressInfo } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { PROTOCOL } from '../shared/protocol.ts';
-import { createApi } from './api.ts';
+import { createApi, type TlsMaterial } from './api.ts';
 import { Store } from './db.ts';
 import { DEFAULT_CONFIG, Engine, type EngineConfig } from './engine.ts';
 import { loadPolicy, savePolicy } from './policy.ts';
@@ -27,10 +29,49 @@ export interface RunningServer {
 
 /** 启动时清理一次过期的会话和通知，之后每小时一次。 */
 const PRUNE_INTERVAL_MS = 3600_000;
+/** 证书文件每小时看一次：续期后换了内容就重新加载，不用重启服务器。 */
+const CERT_RELOAD_MS = 3600_000;
 
-export async function startServer(opts: { engine: Engine; port?: number; host?: string }): Promise<RunningServer> {
+/** HTTPS 的证书和私钥文件（PEM）。 */
+export interface TlsFiles {
+  cert: string;
+  key: string;
+}
+
+function readTls(files: TlsFiles): TlsMaterial {
+  const read = (path: string, what: string) => {
+    try {
+      return readFileSync(path, 'utf8');
+    } catch (e) {
+      throw new Error(`读不了${what}文件 ${path}：${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+  const tls = { cert: read(files.cert, '证书'), key: read(files.key, '私钥') };
+  try {
+    new X509Certificate(tls.cert);
+  } catch {
+    throw new Error(`${files.cert} 不是 PEM 格式的证书`);
+  }
+  return tls;
+}
+
+/** 证书上写的域名（不含通配符的），打印接入命令时用。 */
+export function certNames(certPem: string): string[] {
+  try {
+    const san = new X509Certificate(certPem).subjectAltName ?? '';
+    return san
+      .split(',')
+      .map((s) => /^\s*DNS:(.+)$/.exec(s)?.[1]?.trim() ?? '')
+      .filter((n) => n && !n.includes('*'));
+  } catch {
+    return [];
+  }
+}
+
+export async function startServer(opts: { engine: Engine; port?: number; host?: string; tls?: TlsFiles }): Promise<RunningServer> {
   const { engine } = opts;
-  const server = createApi(engine);
+  let tls = opts.tls ? readTls(opts.tls) : undefined;
+  const server = createApi(engine, tls);
   await new Promise<void>((ok, fail) => {
     server.once('error', fail);
     server.listen(opts.port ?? 7420, opts.host ?? '127.0.0.1', () => {
@@ -49,12 +90,28 @@ export async function startServer(opts: { engine: Engine; port?: number; host?: 
   prune();
   const timer = setInterval(prune, PRUNE_INTERVAL_MS);
   timer.unref();
+  // 证书续期：文件内容变了就换上新的；读不了、格式不对时继续用旧的，记一行
+  const reload = () => {
+    if (!opts.tls || !tls) return;
+    try {
+      const next = readTls(opts.tls);
+      if (next.cert === tls.cert && next.key === tls.key) return;
+      (server as TlsServer).setSecureContext(next);
+      tls = next;
+      engine.event('cert_reloaded', { cert: opts.tls.cert });
+    } catch (e) {
+      engine.event('cert_reload_failed', { error: String(e) });
+    }
+  };
+  const certTimer = setInterval(reload, CERT_RELOAD_MS);
+  certTimer.unref();
   const addr = server.address() as AddressInfo;
   return {
-    url: `http://${addr.address.includes(':') ? `[${addr.address}]` : addr.address}:${addr.port}`,
+    url: `${tls ? 'https' : 'http'}://${addr.address.includes(':') ? `[${addr.address}]` : addr.address}:${addr.port}`,
     engine,
     close: async () => {
       clearInterval(timer);
+      clearInterval(certTimer);
       await new Promise<void>((ok) => {
         server.close(() => ok());
         server.closeAllConnections();
@@ -77,8 +134,9 @@ const USAGE = `用法：
   teamlink-server invite [--count 5] [--data 目录]          生成邀请码（每人一个，用过就失效）
   teamlink-server policy [--allow-domain 域名] [--remove-domain 域名] [--data 目录]
                                                            查看或修改消息里允许出现的链接域名；不带参数时打印当前名单
-  teamlink-server start [--port 7420] [--host 127.0.0.1] [--data 目录]
-                                                           局域网里给队友用时加 --host 0.0.0.0
+  teamlink-server start [--port 7420] [--host 127.0.0.1] [--data 目录] [--cert 证书.pem --key 私钥.pem]
+                                                           局域网里给队友用时加 --host 0.0.0.0；
+                                                           给了 --cert 和 --key 就开 HTTPS（跨公网时用），证书续期后自动重新加载
 
 仓库地址也可以直接写在命令后面：teamlink-server init <git 地址>。数据目录默认是 ./.teamlink-server。`;
 
@@ -107,6 +165,8 @@ export async function runServerCli(argv: string[]): Promise<void> {
         host: { type: 'string', default: '127.0.0.1' },
         'allow-domain': { type: 'string', multiple: true },
         'remove-domain': { type: 'string', multiple: true },
+        cert: { type: 'string' },
+        key: { type: 'string' },
         count: { type: 'string', default: '1' },
         help: { type: 'boolean', short: 'h' },
       },
@@ -164,11 +224,22 @@ export async function runServerCli(argv: string[]): Promise<void> {
     case 'start': {
       const port = Number(values.port);
       if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('--port 要是 0 到 65535 之间的整数');
-      const s = await startServer({ engine, port, host: values.host });
+      if (Boolean(values.cert) !== Boolean(values.key)) throw new Error('--cert 和 --key 要一起给：证书文件和它的私钥文件（PEM 格式）');
+      const tls = values.cert && values.key ? { cert: resolve(values.cert), key: resolve(values.key) } : undefined;
+      const s = await startServer({ engine, port, host: values.host, tls });
       const actual = new URL(s.url).port;
-      console.log(`teamlink 服务器已启动，监听 ${values.host}:${actual}（协议版本 ${PROTOCOL}）`);
-      const hosts = values.host === '0.0.0.0' ? lanAddresses() : [new URL(s.url).hostname];
-      for (const h of hosts) console.log(`  队友在团队仓库目录里运行：curl -fsSL http://${h}:${actual}/install.sh | bash -s -- --invite 邀请码 --name 名字`);
+      console.log(`teamlink 服务器已启动，监听 ${values.host}:${actual}（协议版本 ${PROTOCOL}${tls ? '，HTTPS' : ''}）`);
+      if (tls) {
+        // 证书是签给域名的：接入命令里要写证书上的域名，写 IP 的话 curl 和连接器都会因为证书对不上而拒绝
+        const names = certNames(readFileSync(tls.cert, 'utf8'));
+        for (const h of names.length > 0 ? names : ['<证书上的域名>']) {
+          console.log(`  队友在团队仓库目录里运行：curl -fsSL https://${h}${actual === '443' ? '' : `:${actual}`}/install.sh | bash -s -- --invite 邀请码 --name 名字`);
+        }
+        console.log('  证书要是队友的电脑信任的（Let’s Encrypt、tailscale cert 这类）；自签证书要在每台电脑上设 NODE_EXTRA_CA_CERTS。');
+      } else {
+        const hosts = values.host === '0.0.0.0' ? lanAddresses() : [new URL(s.url).hostname];
+        for (const h of hosts) console.log(`  队友在团队仓库目录里运行：curl -fsSL http://${h}:${actual}/install.sh | bash -s -- --invite 邀请码 --name 名字`);
+      }
       if (values.host === '127.0.0.1' || values.host === 'localhost') console.log('  现在只有本机能连；局域网里给队友用时加 --host 0.0.0.0。');
       break;
     }

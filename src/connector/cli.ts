@@ -10,7 +10,7 @@ import { call, message, NetworkError } from './client.ts';
 import { git, identityFor, loadIdentities, readRepoConfig, REPO_CONFIG, repoRoot, saveIdentity, writeRepoConfig, type Identity, type RepoConfig } from './config.ts';
 import { runHook, type HookEvent } from './hook.ts';
 import { ensureLauncher, installClaude, installCodex, installedTools, type Installed } from './install.ts';
-import { sendNotice } from './notify.ts';
+import { confirmAnswers, send, sendNotice, WAIT_DEFAULT_S, WAIT_MAX_S, waitForAnswer } from './notify.ts';
 import { latestBatches, RECEIVED_FILE } from './received.ts';
 import { status } from './status.ts';
 
@@ -20,7 +20,8 @@ AI 常用
   teamlink notify --to <成员名> --summary "<改了什么、为什么>" [--claim 文件#符号:变更类型]
         告诉队友他用得上、又读不到的东西。--to 必填、可写多次；--claim 可选、可写多次，
         变更类型是 added、removed、signature_changed、behavior_changed
-  teamlink ask <成员名> "<问题>"            问队友只有他知道的事，回答会自动送回
+  teamlink ask <成员名> "<问题>" [--wait]   问队友只有他知道的事，回答会自动送回。--wait：对方在线时就在这条命令里等回答
+        （默认最多 ${WAIT_DEFAULT_S} 秒，--wait=300 改成 300 秒），到了直接打印；没等到的照常自动送回
   teamlink reply <通知号> "<回答>"          回答收到的提问（可以再答一次来更正）
 
 人用
@@ -34,7 +35,7 @@ AI 常用
 
 const USAGE_OF: Record<string, string> = {
   notify: 'teamlink notify --to <成员名> --summary "<说明>" [--claim 文件#符号:变更类型]',
-  ask: 'teamlink ask <成员名> "<问题>"',
+  ask: 'teamlink ask <成员名> "<问题>" [--wait | --wait=秒数]',
   reply: 'teamlink reply <通知号> "<回答>"',
   setup: 'teamlink setup --server <服务器地址> --invite <邀请码> --name <名字> [--claude]',
   join: 'teamlink join <服务器地址> --invite <邀请码> --name <名字>',
@@ -82,6 +83,31 @@ export function parseClaim(s: string): Claim {
   const change = s.slice(colon + 1) as Claim['change'];
   if (!CHANGE_TYPES.includes(change)) throw new Error(`变更类型必须是 ${CHANGE_TYPES.join('、')} 之一，收到：${change}`);
   return { file: s.slice(0, hash), symbol: s.slice(hash + 1, colon), change };
+}
+
+/**
+ * ask 的 --wait：单独一个参数，写成 --wait（等默认的秒数）或 --wait=秒数；从参数里拿掉，其余的照旧是成员名和问题。
+ * 返回 0 表示不等。
+ */
+export function takeWait(args: string[]): { waitSeconds: number; args: string[] } {
+  let waitSeconds = 0;
+  const others: string[] = [];
+  for (const a of args) {
+    const m = /^--wait(?:=(.*))?$/.exec(a);
+    if (!m) {
+      others.push(a);
+      continue;
+    }
+    const n = m[1] === undefined ? WAIT_DEFAULT_S : Number(m[1]);
+    if (!Number.isInteger(n) || n < 1 || n > WAIT_MAX_S) throw new Error(`--wait 的秒数要是 1 到 ${WAIT_MAX_S} 之间的整数，收到：${m[1]}\n用法：${USAGE_OF.ask}`);
+    waitSeconds = n;
+  }
+  return { waitSeconds, args: others };
+}
+
+/** 等标准输出里排着的内容都写出去。 */
+function flushed(): Promise<void> {
+  return new Promise((ok) => process.stdout.write('', () => ok()));
 }
 
 async function readStdin(): Promise<string> {
@@ -167,20 +193,36 @@ export async function runCli(argv: string[], cwd = process.cwd(), print: (s: str
       return 0;
     }
 
-    case 'ask':
+    case 'ask': {
+      const { waitSeconds, args } = takeWait(rest);
+      const [target, ...words] = args;
+      const text = words.join(' ').trim();
+      if (!target || !text) throw new Error(`用法：${USAGE_OF[cmd]}`);
+      const { root, cfg, identity } = context(cwd);
+      const sent = await send(root, cfg, identity, { type: 'question', summary: text, claims: [], to: [target] });
+      // 只在提问真的发出去了、对方又在线时等：暂存进发件箱的（沙箱里连不上服务器）、对方不在线的，回执里已经说了什么时候能收到
+      const online = sent.response?.presence?.some((p) => p.online) ?? false;
+      if (waitSeconds === 0 || !sent.response || !online) {
+        out(sent.text);
+        return 0;
+      }
+      out(`${sent.text}正在等回答（最多 ${waitSeconds} 秒）……`);
+      const got = await waitForAnswer(root, cfg, identity, sent.response.id, sent.response.recipients[0] ?? target, waitSeconds * 1000);
+      out(got.text);
+      if (got.ids.length > 0) {
+        // 打印出去了才向服务器确认：命令在这之前被杀、确认没带到，回答会由 hook 再送一次，不会丢
+        await flushed();
+        await confirmAnswers(cfg, identity, got.ids);
+      }
+      return 0;
+    }
+
     case 'reply': {
       const [target, ...words] = rest;
       const text = words.join(' ').trim();
       if (!target || !text) throw new Error(`用法：${USAGE_OF[cmd]}`);
       const { root, cfg, identity } = context(cwd);
-      out(
-        await sendNotice(
-          root,
-          cfg,
-          identity,
-          cmd === 'ask' ? { type: 'question', summary: text, claims: [], to: [target] } : { type: 'answer', summary: text, claims: [], to: [], replyTo: target },
-        ),
-      );
+      out(await sendNotice(root, cfg, identity, { type: 'answer', summary: text, claims: [], to: [], replyTo: target }));
       return 0;
     }
 
@@ -314,9 +356,10 @@ export async function runCli(argv: string[], cwd = process.cwd(), print: (s: str
         const event = String(positionals[0] ?? '') as HookEvent;
         const tool = (typeof values.tool === 'string' ? values.tool : 'claude') as Tool;
         let emitted = false;
-        const text = await runHook(event, tool, await readStdin(), cwd, (s) => {
+        const text = await runHook(event, tool, await readStdin(), cwd, async (s) => {
           emitted = true;
           print(s);
+          await flushed();
         });
         if (text && !emitted) print(text);
       } catch {

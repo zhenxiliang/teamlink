@@ -1,5 +1,5 @@
 // 本机状态：$(git rev-parse --git-dir)/teamlink/，每个 worktree 各一份（在 .git 里，不会被提交）。
-// hook 之间要交接的东西都放这里：last-session.json、members.json、退避标记、待交的补发结果、
+// hook 之间要交接的东西都放这里：last-session.json、members.json、退避标记、待交的补发结果、待回传的送达确认、
 // 按“工具+会话”分的会话状态（stop 标记）、每个工具 hook 最近一次运行的时间。
 // hook 在 AI 工具的沙箱外运行，读写这里；沙箱里的命令行只读（members.json、退避标记、last-session.json）。
 // 所有写入都先写临时文件再 rename：几条 hook 并行时不会读到写了一半的文件。
@@ -8,6 +8,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Tool } from '../shared/protocol.ts';
+import { MAX_ACKS } from '../shared/protocol.ts';
 import { git, teamlinkHome } from './config.ts';
 
 /** 状态目录在哪（只算路径，不创建）。 */
@@ -291,6 +292,64 @@ export function takeNotes(dir: string): FlushNote[] {
 /** 把需要处理的（被退回）留给下一次能输出的 hook，只是告知的直接丢掉（stop、session-end 用）。 */
 export function keepRejected(dir: string, notes: FlushNote[]): void {
   saveNotes(dir, notes.filter((n) => n.kind === 'rejected'));
+}
+
+// —— 送达确认：hook 把一批消息输出给 AI 以后记下通知号，由之后的送达类请求带给服务器 ——
+
+/** 这么久还没回传成的确认才丢掉：和服务器保留通知的时间一样长（30 天），那时通知本身也清掉了。 */
+const ACK_MAX_AGE_MS = 30 * 24 * 3600_000;
+
+export interface PendingAcks {
+  /** 要回传的通知号（最多 MAX_ACKS 个，多的留到下一个请求）。 */
+  ids: string[];
+  /** 这些通知号所在的文件：服务器收下以后删掉。 */
+  files: string[];
+}
+
+/**
+ * 输出给 AI 以后调用。每批存成新文件，几条 hook 同时存也不会互相覆盖；一个文件最多 MAX_ACKS 个
+ * （一个请求最多带这么多），一批更多就分成几个文件：回传时整个文件要么全带上、要么留到下一次。
+ */
+export function saveAcks(dir: string, ids: string[]): void {
+  // 同一批的几个文件名字只差最后的序号：回传时按名字排序，就是原来的先后
+  const base = `${Date.now()}-${process.pid}-${randomBytes(3).toString('hex')}`;
+  for (let i = 0; i < ids.length; i += MAX_ACKS) {
+    writeAtomic(join(dir, 'acks', `${base}-${String(i / MAX_ACKS).padStart(3, '0')}.json`), JSON.stringify(ids.slice(i, i + MAX_ACKS)));
+  }
+}
+
+/** 读出还没回传的确认，不取走：几条 hook 并行时各带一份也没关系，服务器重复收到不会出错。 */
+export function pendingAcks(dir: string): PendingAcks {
+  const sub = join(dir, 'acks');
+  const out: PendingAcks = { ids: [], files: [] };
+  if (!existsSync(sub)) return out;
+  const now = Date.now();
+  for (const name of readdirSync(sub).filter((f) => f.endsWith('.json')).sort()) {
+    const path = join(sub, name);
+    const ids = readJson<unknown>(path);
+    const at = Number(name.split('-')[0]);
+    if (!Array.isArray(ids) || (Number.isFinite(at) && now - at > ACK_MAX_AGE_MS)) {
+      rmSync(path, { force: true });
+      continue;
+    }
+    const list = ids.filter((x): x is string => typeof x === 'string');
+    if (list.length > MAX_ACKS) {
+      // 不是这一版存的（一个文件不会超过上限）：拆开重存，下一次再带
+      saveAcks(dir, list);
+      rmSync(path, { force: true });
+      continue;
+    }
+    // 这个文件带不全就整个留到下一次：只带一部分又把文件删掉的话，剩下的永远确认不了
+    if (out.ids.length + list.length > MAX_ACKS) break;
+    out.ids.push(...list);
+    out.files.push(path);
+  }
+  return out;
+}
+
+/** 服务器收下了：删掉这些文件。 */
+export function clearAcks(files: string[]): void {
+  for (const f of files) rmSync(f, { force: true });
 }
 
 // —— 按“工具+会话”分的会话状态：sessions/<工具>-<会话号>/ 下的 stop.json ——

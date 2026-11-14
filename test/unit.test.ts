@@ -7,10 +7,12 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
-import { normalizeGitUrl, parseClaim } from '../src/connector/cli.ts';
+import { normalizeGitUrl, parseClaim, takeWait } from '../src/connector/cli.ts';
+import { originOf } from '../src/connector/origin.ts';
 import { CLAUDE_HOOKS, CODEX_HOOKS, ensureAgentsSection, mergeHooks } from '../src/connector/install.ts';
 import { renderNotes } from '../src/connector/outbox.ts';
 import { latestBatches, saveReceived } from '../src/connector/received.ts';
+import { clearAcks, pendingAcks, saveAcks } from '../src/connector/state.ts';
 import { claimError, INJECTION_BUDGET_BYTES, memberNameError, type Claim, type Teammate } from '../src/shared/protocol.ts';
 import { CONNECTED_TEXT, HEADER, normalizeText, renderBatch, renderEntry, renderOthers, renderTeammate, renderTeammates, type RenderItem } from '../src/shared/render.ts';
 import { DEFAULT_POLICY } from '../src/shared/rules.ts';
@@ -50,7 +52,7 @@ const message: RenderItem = {
 test('渲染：提问、回答、消息的格式（变更类型用中文）', () => {
   assert.equal(
     renderEntry(question, 1),
-    '[1] 提问 · 来自 阿明 · n_q1：你那边 compare 的返回字段定了吗？\n    回答：teamlink reply n_q1 "…"（只有你的用户知道的，先在对话里问他）',
+    '[1] 提问 · 来自 阿明 · n_q1：你那边 compare 的返回字段定了吗？\n    回答：teamlink reply n_q1 "…"（只有你的用户知道的，先在对话里问他；写明依据：用户说的、本机查到的，还是你的推测）',
   );
   // 回答带上提问的前 30 个字，多的写“…”
   assert.equal(renderEntry(answer, 2), '[2] 回答 · 来自 丽丽 · 回复你的提问 n_yyy「比较接口的差值方向是 a−b 还是 b−a？另外字段名叫什么…」：定了，返回 diff 和 direction。');
@@ -575,4 +577,60 @@ test('received.md：只存消息条目，最新的在最前面，最多 30 批',
   assert.ok(size <= 60 * 1024, `${size} 字节`);
   assert.match(latestBatches(repo, 1)[0], /大批 10 /);
   assert.doesNotMatch(readFileSync(join(repo, '.team/received.md'), 'utf8'), /大批 1 |第 35 批/);
+});
+
+// —— 这一版加的：本人写的标记、--wait 的解析 ——
+
+test('谁写的：本人在终端里写的在名字后面标“（本人写的）”，AI 会话发的和旧连接器发的不标；成员名里不能带这个标记', () => {
+  assert.equal(renderEntry({ ...message, claims: [], via: 'person' }, 1), '[1] 消息 · 来自 大伟（本人写的）：回测对比接口改好了');
+  assert.match(renderEntry({ ...question, via: 'person' }, 1), /^\[1\] 提问 · 来自 阿明（本人写的） · n_q1：/);
+  assert.match(renderEntry({ ...answer, via: 'person' }, 2), /^\[2\] 回答 · 来自 丽丽（本人写的） · 回复你的提问 n_yyy/);
+  for (const via of ['ai', null, undefined] as const) assert.equal(renderEntry({ ...message, claims: [], via }, 1), '[1] 消息 · 来自 大伟：回测对比接口改好了');
+  assert.match(memberNameError('阿明（本人写的）') ?? '', /成员名里不能有（本人写的）/);
+});
+
+test('谁写的：有 AI 工具的环境变量就算 AI；没有、标准输入输出又都是终端才算本人；拿不准一律算 AI', () => {
+  assert.equal(originOf({}, true), 'person');
+  assert.equal(originOf({}, false), 'ai', '输出被接走了（AI 工具、管道）');
+  for (const k of ['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SANDBOX', 'AI_AGENT']) assert.equal(originOf({ [k]: '1' }, true), 'ai', k);
+  assert.equal(originOf({ CLAUDECODE: '' }, true), 'person', '空值不算');
+});
+
+test('ask 的 --wait：单独一个参数，--wait 等默认的 90 秒，--wait=秒数 自己定；秒数不对当场报错；其余参数原样留下', () => {
+  assert.deepEqual(takeWait(['阿明', '几小时一根 K 线？']), { waitSeconds: 0, args: ['阿明', '几小时一根 K 线？'] });
+  assert.deepEqual(takeWait(['阿明', '问题', '--wait']), { waitSeconds: 90, args: ['阿明', '问题'] });
+  assert.deepEqual(takeWait(['--wait=300', '阿明', '问题']), { waitSeconds: 300, args: ['阿明', '问题'] });
+  // 问题里提到 --wait 不算（它不是单独的一个参数）
+  assert.deepEqual(takeWait(['阿明', '要不要加 --wait 参数？']), { waitSeconds: 0, args: ['阿明', '要不要加 --wait 参数？'] });
+  for (const bad of ['--wait=abc', '--wait=0', '--wait=3601', '--wait=1.5', '--wait=']) assert.throws(() => takeWait(['阿明', '问题', bad]), /--wait 的秒数要是 1 到 3600 之间的整数/, bad);
+});
+
+test('送达确认的本地记录：一批超过 200 条时分成几个文件，一个请求带不全的整个留到下一次，不会带了一部分就把文件删掉', () => {
+  const dir = join(tmp, 'acks-state');
+  const ids = Array.from({ length: 250 }, (_, i) => `n_${String(i).padStart(4, '0')}`);
+  saveAcks(dir, ids);
+  const first = pendingAcks(dir);
+  assert.equal(first.ids.length, 200);
+  assert.equal(first.files.length, 1);
+  clearAcks(first.files);
+  const second = pendingAcks(dir);
+  assert.equal(second.ids.length, 50);
+  assert.deepEqual([...first.ids, ...second.ids].sort(), ids, '250 条都带到了，一条不丢');
+  clearAcks(second.files);
+  assert.deepEqual(pendingAcks(dir), { ids: [], files: [] });
+  // 几批小的可以合在一个请求里
+  saveAcks(dir, ['n_a']);
+  saveAcks(dir, ['n_b', 'n_c']);
+  assert.deepEqual(pendingAcks(dir).ids.sort(), ['n_a', 'n_b', 'n_c']);
+  // 别处写的超大文件（不是这一版存的）：拆开重存，下一次再带，不截断
+  writeFileSync(join(dir, 'acks', `${Date.now()}-1-big.json`), JSON.stringify(ids));
+  pendingAcks(dir);
+  const all: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    const p = pendingAcks(dir);
+    if (p.ids.length === 0) break;
+    all.push(...p.ids);
+    clearAcks(p.files);
+  }
+  assert.deepEqual([...new Set(all)].sort(), [...ids, 'n_a', 'n_b', 'n_c'].sort());
 });

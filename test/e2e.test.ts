@@ -7,6 +7,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { closeSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { createServer, get as httpGet, type ServerResponse } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { connect, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -22,8 +23,9 @@ import { generateDeviceKeys, signRequest } from '../src/shared/crypto.ts';
 import { INJECTION_BUDGET_BYTES, PROTOCOL, PROTOCOL_HEADER, type Tool } from '../src/shared/protocol.ts';
 import { HEADER } from '../src/shared/render.ts';
 import { DEFAULT_POLICY } from '../src/shared/rules.ts';
+import { SCHEMA_VERSION } from '../src/server/db.ts';
 import type { Engine } from '../src/server/engine.ts';
-import { openEngine, startServer, type RunningServer } from '../src/server/main.ts';
+import { certNames, openEngine, startServer, type RunningServer } from '../src/server/main.ts';
 import { loadPolicy } from '../src/server/policy.ts';
 import { reviewMessage } from '../src/server/review.ts';
 
@@ -153,7 +155,11 @@ const delivered = (noticeId: string, name: string) =>
 function fresh() {
   const old = new Date(Date.now() - 8 * DAY).toISOString();
   engine.store.run('UPDATE sessions SET last_seen_at = ?, ended_at = COALESCE(ended_at, ?)', old, old);
-  engine.store.run("UPDATE recipients SET delivered_at = ?, delivered_session = 'test:fresh' WHERE delivered_at IS NULL", new Date().toISOString());
+  const now = new Date().toISOString();
+  // 交出去了、还没确认的也都算确认过：不会在后面的用例里被重发
+  engine.store.run("UPDATE recipients SET delivered_at = COALESCE(delivered_at, ?), delivered_session = COALESCE(delivered_session, 'test:fresh'), acked_at = ? WHERE acked_at IS NULL", now, now);
+  // 本地记着、还没回传的送达确认也清掉
+  for (const dev of Object.values(devs)) rmSync(join(stateDir(dev), 'acks'), { recursive: true, force: true });
   // 本地也一样：前面的用例留下的会话都算结束了（不然会被当成同一个工作区里还开着另一个会话）
   for (const dev of Object.values(devs)) rmSync(join(stateDir(dev), 'last-session.json'), { force: true });
 }
@@ -684,7 +690,7 @@ test('问答：只有被问的人能回答（403），提问不存在返回 404�
   assert.equal(await as(alice, 'ask', 'bob', question), '已发给 bob。\n');
   const got = await postTool(bob, 'bob-qa');
   const qid = new RegExp(`\\n\\[1\\] 提问 · 来自 alice · (n_[0-9a-f]+)：${esc(question)}\\n`).exec(got)?.[1] ?? assert.fail(got);
-  assert.ok(got.includes(`\n    回答：teamlink reply ${qid} "…"（只有你的用户知道的，先在对话里问他）\n`), got);
+  assert.ok(got.includes(`\n    回答：teamlink reply ${qid} "…"（只有你的用户知道的，先在对话里问他；写明依据：用户说的、本机查到的，还是你的推测）\n`), got);
   assert.ok(received(bob).includes(`· ${qid}：${question}`), '送到的提问存进 received.md');
 
   // 只有被问的人能回答；提问不存在 404
@@ -1622,8 +1628,9 @@ test('队友概况：开工时每人一行（名字、工具、在线或上次�
 const AGENTS_TEXT = [
   '## 团队协作（teamlink）',
   '',
-  '- 队友的消息会在你运行命令时自动转给你（包在 `<team-notices-…>` 标签里），不用去查。怀疑漏了（比如在等的回答一直没到），看 `.team/received.md`（可以 grep 通知号或队友的名字）。',
-  '- 能从代码里读到的直接读代码，不要问人。只有对方知道的才问：他做到哪了、他和他的用户定了什么、他电脑上的情况，用 `teamlink ask 成员名 "问题"`，回答会自动送回。成员名见开工时转来的队友列表。',
+  '- 队友的消息会在你运行命令时自动转给你（包在 `<team-notices-…>` 标签里），不用去查。怀疑漏了（比如在等的回答一直没到），看 `.team/received.md`（可以 grep 通知号或队友的名字）。发送人后面标着“（本人写的）”的是对方本人亲手写的，没标的是对方的 AI 发的。',
+  '- 能从代码里读到的直接读代码，不要问人。只有对方知道的才问：他做到哪了、他和他的用户定了什么、他电脑上的情况，用 `teamlink ask 成员名 "问题"`，回答会自动送回。成员名见开工时转来的队友列表。下一步就卡在这个答案上、对方又在线时，加 `--wait`：在这条命令里等回答（最多 90 秒，`--wait=300` 改成 300 秒），等不到的照常自动送回。',
+  '- 回答别人的提问时写明依据：是你的用户说的、你在本机查到的，还是你的推测。只有你的用户知道的，先在对话里问他，不要替他猜。',
   '- 你这边有队友用得上、他又读不到的东西（还没合并的接口改动、给他做好的功能、你的用户刚定的决定），告诉他：',
   '  `teamlink notify --to 成员名 --summary "改了什么、为什么" --claim 文件#符号:变更类型`',
   '  `--to` 必填、可写多次；`--claim` 可选、可写多次，变更类型是 added、removed、signature_changed、behavior_changed；不必先提交。只写事实，不带命令和链接。',
@@ -2215,7 +2222,7 @@ const snapshot = (path: string) =>
     return { version: (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, schema, rows };
   });
 
-test('迁移：旧结构的库升级到版本 2——先备份，旧设备的签名请求照常通过，没送达的旧提问送到收件人，其余旧通知清掉；add-repo 能成功', async () => {
+test('迁移：旧结构的库升级到现在的版本——先备份，旧设备的签名请求照常通过，没送达的旧提问送到收件人，其余旧通知清掉；add-repo 能成功', async () => {
   const dir = join(tmp, 'migrate');
   const ming = generateDeviceKeys();
   const lili = generateDeviceKeys();
@@ -2225,7 +2232,7 @@ test('迁移：旧结构的库升级到版本 2——先备份，旧设备的签
   const logs: string[] = [];
   const e = openEngine(dir, { log: (line) => logs.push(line) });
   try {
-    assert.equal(userVersion(path), 2);
+    assert.equal(userVersion(path), SCHEMA_VERSION);
     assert.equal(userVersion(`${path}.v1.bak`), 0, '先备份成 teamlink.db.v1.bak，备份是旧结构');
     assert.ok(tables(`${path}.v1.bak`).includes('activity'));
     assert.deepEqual(tables(path), ['devices', 'invites', 'members', 'notices', 'recipients', 'repos', 'sessions']);
@@ -2233,7 +2240,7 @@ test('迁移：旧结构的库升级到版本 2——先备份，旧设备的签
       e.store.all<{ name: string }>('PRAGMA table_info(repos)').map((c) => c.name),
       ['id', 'url', 'created_at'],
     );
-    assert.match(logs.join('\n'), /数据库已升级到结构版本 2，搬过来 4 条通知[^\n]*丢掉 5 条/);
+    assert.match(logs.join('\n'), /数据库已升级到结构版本 3，搬过来 4 条通知[^\n]*丢掉 5 条/);
     // 提问、回答保持原类型，其余改成消息；7 天内的提问即使已经送到也搬过来（升级后还能回答，见服务器交接第 6 节第 2 条）
     assert.deepEqual(
       e.store.all<{ id: string; type: string }>('SELECT id, type FROM notices ORDER BY id').map((n) => `${n.id}:${n.type}`),
@@ -2273,7 +2280,7 @@ test('迁移：旧结构的库升级到版本 2——先备份，旧设备的签
   const add = await run(process.execPath, [SERVER_BIN, 'add-repo', '--repo', missing, '--data', dir]);
   assert.equal(add.code, 0, add.out + add.err);
   assert.match(add.out, /^已登记仓库 /);
-  assert.equal(userVersion(path), 2);
+  assert.equal(userVersion(path), SCHEMA_VERSION);
   const again = openEngine(dir, { log: () => {} });
   try {
     assert.equal(again.store.migration, null);
@@ -2308,7 +2315,7 @@ test('迁移：中途出错时回滚，库保持原样，报错并以非 0 退�
   fix.exec('DROP VIEW broken');
   fix.close();
   openEngine(dir, { log: () => {} }).store.db.close();
-  assert.equal(userVersion(path), 2);
+  assert.equal(userVersion(path), SCHEMA_VERSION);
   assert.equal(readFileSync(`${path}.v1.bak`, 'utf8'), '以前的备份');
   assert.ok(readdirSync(dir).some((f) => /^teamlink\.db\.v1\.\d{4}-.+\.bak$/.test(f)), readdirSync(dir).join(' '));
 });
@@ -2386,9 +2393,9 @@ test('迁移：服务器和管理命令同时打开旧库时，只有拿到锁�
   db.close();
   const runs = await Promise.all([0, 1, 2, 3].map((i) => run(process.execPath, [SERVER_BIN, 'add-repo', '--repo', `git@example.com:team/race${i}.git`, '--data', dir])));
   for (const r of runs) assert.equal(r.code, 0, r.out + r.err);
-  assert.equal(runs.filter((r) => r.err.includes('数据库已升级到结构版本 2')).length, 1, '只有一个去迁移');
+  assert.equal(runs.filter((r) => r.err.includes('数据库已升级到结构版本 3')).length, 1, '只有一个去迁移');
   assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith('.bak')), ['teamlink.db.v1.bak'], '只备份一份');
-  assert.equal(userVersion(path), 2);
+  assert.equal(userVersion(path), SCHEMA_VERSION);
   const e = openEngine(dir, { log: () => {} });
   try {
     assert.equal(e.store.repos().length, 5);
@@ -2409,7 +2416,7 @@ test('清理：engine.prune() 删掉 30 天没活动的会话、30 天前的通�
   const notice = (id: string, createdAt: string) =>
     s.transaction(() =>
       s.insertNotice(
-        { id, repo_id: repoId, sender_member_id: memberId('alice'), sender_session_id: null, type: 'message', summary: id, claims: [], to_names: ['bob'], reply_to: null, client_id: null, created_at: createdAt },
+        { id, repo_id: repoId, sender_member_id: memberId('alice'), sender_session_id: null, type: 'message', summary: id, claims: [], to_names: ['bob'], reply_to: null, client_id: null, created_at: createdAt, via: null },
         [memberId('bob')],
       ),
     );
@@ -2652,4 +2659,413 @@ test('命令行：帮助按“AI 常用”“人用”两组列出，不列删�
   assert.match(dash, /--summary=/);
   assert.doesNotMatch(dash, /不认识的参数/);
   assert.match(dash, /\n用法：teamlink notify /);
+});
+
+// —— 送达确认 ——
+
+const ackedAt = (noticeId: string, name: string) =>
+  engine.store.get<{ acked_at: string | null }>('SELECT acked_at FROM recipients WHERE notice_id = ? AND member_id = ?', noticeId, memberId(name))?.acked_at ?? null;
+const attemptsOf = (noticeId: string, name: string) =>
+  engine.store.get<{ attempts: number }>('SELECT attempts FROM recipients WHERE notice_id = ? AND member_id = ?', noticeId, memberId(name))?.attempts ?? -1;
+const ackFiles = (dev: Dev) => jsonFiles(join(stateDir(dev), 'acks'));
+
+/** 测试期间把“多久没确认就重发”调短（之后的间隔是它的 6 倍、60 倍……）；fn 结束后恢复。 */
+async function quickResend<T>(fn: () => Promise<T>, ms = 1): Promise<T> {
+  const saved = engine.config.resendAfterMs;
+  engine.config.resendAfterMs = ms;
+  try {
+    return await fn();
+  } finally {
+    engine.config.resendAfterMs = saved;
+  }
+}
+
+test('送达确认：交出去以后要连接器确认才算送到；没确认的，同一个会话过一会儿再来时重发，间隔逐次拉长，发到确认为止；别的会话要等它结束；旧连接器（不带 acks）照旧当场算送到', async () => {
+  fresh();
+  const { alice, bob, carol } = devs;
+  const activity = (dev: Dev, session: string, acks?: string[]) => signed(dev, 'POST', '/api/v2/activity', { repoId, tool: 'claude', sessionId: session, ...(acks ? { acks } : {}) });
+  const send = async (summary: string) => {
+    await as(alice, 'notify', '--to', 'bob', '--summary', summary);
+    return latestNotice().id;
+  };
+
+  // 1. 交出去了、没确认（hook 超时被杀，或者响应丢在路上）
+  const n1 = await send('确认测试：第一条');
+  assert.deepEqual((await activity(bob, 'bob-ack', [])).body.ids, [n1]);
+  assert.ok(delivered(n1, 'bob'), '记了交出的时间');
+  assert.equal(ackedAt(n1, 'bob'), null, '还没确认');
+  // 没到重发的时间（Codex 并行的另一条 hook 这时候来）：不给第二遍
+  assert.deepEqual((await activity(bob, 'bob-ack', [])).body.ids, []);
+  // 同一个人的另一个会话：交给的那个会话还在线，不给它
+  assert.deepEqual((await activity(bob, 'bob-ack-other', [])).body.ids, []);
+  // inbox 只列没交出去过的
+  assert.equal(await as(bob, 'inbox'), '没有还没送到的消息。\n');
+  await quickResend(async () => {
+    await sleep(60);
+    // 到时间了，同一个会话再来、还是没确认：重发
+    const again = await activity(bob, 'bob-ack', []);
+    assert.deepEqual(again.body.ids, [n1]);
+    assert.match(again.body.text, /\n\[1\] 消息 · 来自 alice：确认测试：第一条\n/);
+    assert.ok(serverLog.some((l) => l.includes('notice_resent') && l.includes(n1)), '重发记进服务器日志');
+    assert.equal(attemptsOf(n1, 'bob'), 2);
+    // 再没确认：下一次重发隔得更久（这里是 6 倍）
+    await sleep(60);
+    assert.deepEqual((await activity(bob, 'bob-ack', [])).body.ids, [], '还没到下一次重发的时间');
+    await sleep(220);
+    assert.deepEqual((await activity(bob, 'bob-ack', [])).body.ids, [n1]);
+    assert.equal(attemptsOf(n1, 'bob'), 3);
+    // 发够了几次也不当成送到：只有确认了才算
+    assert.equal(ackedAt(n1, 'bob'), null);
+    assert.deepEqual((await activity(bob, 'bob-ack', [n1])).body.ids, []);
+    assert.ok(ackedAt(n1, 'bob'));
+  }, 40);
+
+  // 2. 确认了的不重发；别人确认不了你的消息
+  const n2 = await send('确认测试：第二条');
+  assert.deepEqual((await activity(bob, 'bob-ack', [])).body.ids, [n2]);
+  await activity(carol, 'carol-ack', [n2]);
+  assert.equal(ackedAt(n2, 'bob'), null, 'carol 确认不了发给 bob 的');
+  assert.deepEqual((await activity(bob, 'bob-ack', [n2, 'n_bogus'])).body.ids, []);
+  assert.ok(ackedAt(n2, 'bob'));
+  await quickResend(async () => {
+    await sleep(5);
+    assert.deepEqual((await activity(bob, 'bob-ack', [])).body.ids, []);
+  });
+
+  // 3. 交给的会话结束了、一直没确认：这个人的下一个会话收到
+  const n3 = await send('确认测试：第三条');
+  assert.deepEqual((await activity(bob, 'bob-ack', [])).body.ids, [n3]);
+  await quickResend(async () => {
+    await sleep(5);
+    assert.deepEqual((await activity(bob, 'bob-ack-other', [])).body.ids, [], '那个会话还在线，再久也等它');
+  });
+  await signed(bob, 'POST', '/api/v2/sessions/end', { tool: 'claude', sessionId: 'bob-ack' });
+  assert.deepEqual((await activity(bob, 'bob-ack-other', [])).body.ids, [n3]);
+
+  // 4. 会话结束时顺带确认
+  await signed(bob, 'POST', '/api/v2/sessions/end', { tool: 'claude', sessionId: 'bob-ack-other', acks: [n3] });
+  assert.ok(ackedAt(n3, 'bob'));
+  assert.doesNotMatch((await signed(bob, 'POST', '/api/v2/sessions/start', { repoId, tool: 'claude', sessionId: 'bob-ack-new', acks: [] })).body.text, /确认测试/);
+
+  // 5. 旧连接器：请求里没有 acks 字段，不会回确认，交出时就算送到
+  const n5 = await send('确认测试：给旧连接器的');
+  assert.deepEqual((await activity(bob, 'bob-ack-new')).body.ids, [n5]);
+  assert.ok(ackedAt(n5, 'bob'));
+});
+
+test('送达确认：先后不乱——同一个发送人前面有一条交出去还没确认时，他后面的不会先到：刚交出去就等它，已经在等重发了就提前一起发；别的发送人不受影响', async () => {
+  fresh();
+  const { alice, bob, carol } = devs;
+  const activity = (acks: string[]) => signed(bob, 'POST', '/api/v2/activity', { repoId, tool: 'claude', sessionId: 'bob-order', acks });
+  const send = async (from: Dev, summary: string) => {
+    await as(from, 'notify', '--to', 'bob', '--summary', summary);
+    return latestNotice().id;
+  };
+  await quickResend(async () => {
+    // 原文交出去了，响应丢在路上
+    const a1 = await send(alice, '限额是每分钟 10 笔');
+    assert.deepEqual((await activity([])).body.ids, [a1]);
+    // 紧接着来了更正，还有别人的一条
+    const a2 = await send(alice, '更正：限额是每分钟 20 笔');
+    const c1 = await send(carol, 'carol 的消息');
+    // 原文刚交出去（可能还在路上）：alice 的更正先等它，carol 的照常送
+    assert.deepEqual((await activity([])).body.ids, [c1]);
+    await sleep(350);
+    // 到了重发的时间：原文和更正一起到，原文在前
+    const both = await activity([c1]);
+    assert.deepEqual(both.body.ids, [a1, a2]);
+    assert.match(both.body.text, /\n\[1\] 消息 · 来自 alice：限额是每分钟 10 笔\n\[2\] 消息 · 来自 alice：更正：限额是每分钟 20 笔\n/);
+    // 原文又没确认（在等下一次重发，间隔已经拉长），这时 alice 再来一条：原文提前，和新的一起发，还是原文在前
+    await sleep(350);
+    const a3 = await send(alice, '再补一句：冷却期 30 秒');
+    assert.deepEqual((await activity([a2])).body.ids, [a1, a3]);
+    // 都确认了就不再发
+    assert.deepEqual((await activity([a1, a3])).body.ids, []);
+  }, 300);
+});
+
+test('送达确认：hook 输出以后把通知号记在本地，下一个 hook 带给服务器；收尾时交出的由会话结束那个请求确认', async () => {
+  fresh();
+  const { alice, bob } = devs;
+  await postTool(bob, 'bob-hk');
+  await as(alice, 'notify', '--to', 'bob', '--summary', 'hook 确认：第一条');
+  const n1 = latestNotice().id;
+  assert.match(await postTool(bob, 'bob-hk'), /hook 确认：第一条/);
+  assert.equal(ackFiles(bob).length, 1, '输出以后记在本地');
+  assert.equal(ackedAt(n1, 'bob'), null);
+  // 下一个 hook 带上确认；服务器收下以后本地的删掉
+  assert.equal(await postTool(bob, 'bob-hk'), '');
+  assert.ok(ackedAt(n1, 'bob'));
+  assert.deepEqual(ackFiles(bob), []);
+
+  // 响应丢了（hook 被杀，什么都没输出）：过一会儿这个会话的下一个 hook 重新拿到
+  await as(alice, 'notify', '--to', 'bob', '--summary', 'hook 确认：丢过一次的');
+  const n2 = latestNotice().id;
+  assert.deepEqual((await signed(bob, 'POST', '/api/v2/activity', { repoId, tool: 'claude', sessionId: 'bob-hk', acks: [] })).body.ids, [n2]);
+  await quickResend(async () => {
+    await sleep(5);
+    assert.match(await postTool(bob, 'bob-hk'), /hook 确认：丢过一次的/);
+  });
+  assert.match(received(bob), /hook 确认：丢过一次的/);
+
+  // 收尾检查拦下时交出的一批：AI 处理完再次结束，这次不输出、不取新消息，只把确认带回去
+  await hook(bob, 'prompt', 'claude', { session_id: 'bob-hk', prompt: '继续' });
+  await as(alice, 'notify', '--to', 'bob', '--summary', 'hook 确认：收尾时到的');
+  const n3 = latestNotice().id;
+  const blocked = await stop(bob, 'claude', 'bob-hk');
+  assert.match(blocked?.reason ?? '', /hook 确认：收尾时到的/);
+  assert.equal(ackedAt(n3, 'bob'), null);
+  await as(alice, 'notify', '--to', 'bob', '--summary', 'hook 确认：拦过以后才到的');
+  const n4 = latestNotice().id;
+  assert.equal(await stop(bob, 'claude', 'bob-hk', { stop_hook_active: true }), null);
+  assert.ok(ackedAt(n3, 'bob'), '拦下的那一批确认了');
+  assert.equal(delivered(n4, 'bob'), null, '这次结束不取新消息');
+  assert.deepEqual(ackFiles(bob), []);
+
+  // 会话结束的请求也顺带确认：新的一回合开头收到的，没等到下一个 hook 会话就关了
+  assert.match(await hook(bob, 'prompt', 'claude', { session_id: 'bob-hk', prompt: '再继续' }), /hook 确认：拦过以后才到的/);
+  assert.equal(ackedAt(n4, 'bob'), null);
+  assert.equal(await hookRaw(bob, 'session-end', 'claude', { session_id: 'bob-hk' }), '');
+  assert.ok(ackedAt(n4, 'bob'));
+  assert.deepEqual(ackFiles(bob), []);
+});
+
+// —— ask --wait ——
+
+/** 等到服务器上最新一条通知是这句话（另一头的命令还在跑，没法 await 它）。 */
+async function untilNotice(summary: string): Promise<string> {
+  for (let i = 0; i < 200; i++) {
+    const n = engine.store.get<NoticeRow>('SELECT * FROM notices WHERE summary = ?', summary);
+    if (n) return n.id;
+    await sleep(20);
+  }
+  return assert.fail(`没等到通知：${summary}`);
+}
+
+test('ask --wait：对方在线时在这条命令里等回答，到了直接打印、存进 received.md，hook 不会再注入一遍；对方不在线不等；等不到的照常由 hook 送到', async () => {
+  fresh();
+  const { alice, bob, carol } = devs;
+  await postTool(alice, 'alice-wait');
+  await postTool(bob, 'bob-wait');
+
+  // 1. 对方在线、很快回答
+  const asking = as(alice, 'ask', 'bob', '本机数据是几小时一根 K 线？', '--wait=20');
+  const qid = await untilNotice('本机数据是几小时一根 K 线？');
+  assert.match(await postTool(bob, 'bob-wait'), new RegExp(`提问 · 来自 alice · ${qid}：本机数据是几小时一根 K 线？`));
+  await as(bob, 'reply', qid, '4 小时一根（本机查到的）');
+  const out = await asking;
+  assert.match(out, /^已发给 bob。正在等回答（最多 20 秒）……\n/);
+  assert.match(out, new RegExp(`\\n\\[1\\] 回答 · 来自 bob · 回复你的提问 ${qid}「本机数据是几小时一根 K 线？」：4 小时一根（本机查到的）\\n`));
+  assert.ok(out.includes(HEADER), '和 hook 注入的一样带着“只是参考”的说明');
+  assert.match(received(alice), /4 小时一根（本机查到的）/);
+  const aid = latestNotice().id;
+  assert.ok(ackedAt(aid, 'alice'), '当场算送到');
+  assert.doesNotMatch(await postTool(alice, 'alice-wait'), /4 小时一根/, 'hook 不再注入一遍');
+
+  // 2. 没等到：说明一句，回答之后照常由 hook 送到
+  const slow = await as(alice, 'ask', 'bob', '下单限额是多少？', '--wait=1');
+  assert.match(slow, /^已发给 bob。正在等回答（最多 1 秒）……\n等了 1 秒，bob 还没回答。回答到了会自动转给你，先做不依赖这条信息的部分。\n$/);
+  const q2 = latestNotice().id;
+  await postTool(bob, 'bob-wait');
+  await as(bob, 'reply', q2, '每分钟 20 笔');
+  assert.match(await postTool(alice, 'alice-wait'), /回答 · 来自 bob · [^\n]*：每分钟 20 笔/);
+
+  // 3. 对方不在线：不等，回执照旧
+  const off = await as(alice, 'ask', 'carol', '你那边部署好了吗？', '--wait');
+  assert.match(off, /^已发给 carol。carol 现在不在线/);
+  assert.doesNotMatch(off, /正在等回答/);
+
+  // 4. 沙箱里连不上服务器：存进发件箱，不等
+  const boxed = await offline(() => as(alice, 'ask', 'bob', '沙箱里问的？', '--wait'));
+  assert.doesNotMatch(boxed, /正在等回答/);
+  assert.equal(outbox(alice).length, 1);
+  await postTool(alice, 'alice-wait');
+  assert.equal(outbox(alice).length, 0);
+
+  // 5. 秒数写错当场报错，什么都不发
+  const before = noticeCount();
+  assert.match(await fails(alice, 'ask', 'bob', '问题', '--wait=abc'), /--wait 的秒数要是 1 到 3600 之间的整数/);
+  assert.equal(noticeCount(), before);
+
+  // 6. 取走的回答也要确认：响应丢了、命令在打印前被杀了，下一次轮询还能再拿到；确认以后才算送到
+  await as(alice, 'ask', 'bob', '冷却期是多少秒？');
+  const q3 = latestNotice().id;
+  await postTool(bob, 'bob-wait');
+  await as(bob, 'reply', q3, '30 秒');
+  const a3 = latestNotice().id;
+  const take = () => signed(alice, 'POST', '/api/v2/answers/take', { repoId, question: q3 });
+  assert.deepEqual((await take()).body.ids, [a3]);
+  assert.equal(ackedAt(a3, 'alice'), null);
+  assert.deepEqual((await take()).body.ids, [a3], '没确认的再轮询一次还在');
+  assert.doesNotMatch(await postTool(alice, 'alice-wait'), /30 秒/, '刚被 --wait 拿走，hook 先不重复给');
+  // 一直没确认（命令被杀了）：hook 过一会儿重发
+  await quickResend(async () => {
+    await sleep(5);
+    assert.match(await postTool(alice, 'alice-wait'), /回答 · 来自 bob · [^\n]*：30 秒/);
+  });
+  // 确认了的不再出现
+  await as(bob, 'reply', q3, '更正：60 秒');
+  const a4 = latestNotice().id;
+  assert.deepEqual((await take()).body.ids, [a4]);
+  assert.equal((await signed(alice, 'POST', '/api/v2/acks', { acks: [a4] })).status, 200);
+  assert.ok(ackedAt(a4, 'alice'));
+  assert.deepEqual((await take()).body.ids, []);
+
+  // 7. 只能取自己提问的回答
+  assert.equal((await signed(bob, 'POST', '/api/v2/answers/take', { repoId, question: q2 })).status, 403);
+  assert.equal((await signed(alice, 'POST', '/api/v2/answers/take', { repoId, question: 'n_nope' })).status, 404);
+  assert.equal((await signed(alice, 'POST', '/api/v2/answers/take', { repoId, question: aid })).status, 404, '不是提问');
+});
+
+// —— 谁写的 ——
+
+test('谁写的：连接器报 person 的在名字后面标“（本人写的）”；AI 会话里发的、旧连接器发的、乱填的都不标', async () => {
+  fresh();
+  const { alice, bob } = devs;
+  const post = (via: unknown, summary: string) => signed(alice, 'POST', '/api/v2/notices', { repoId, type: 'message', summary, to: ['bob'], ...(via === undefined ? {} : { via }) });
+  assert.equal((await post('person', '限额我刚和交易所确认过：每分钟 20 笔')).status, 200);
+  assert.equal((await post('ai', '接口加了必填参数')).status, 200);
+  assert.equal((await post(undefined, '旧连接器发的')).status, 200);
+  assert.equal((await post('root', '乱填的')).status, 200);
+  const got = await hook(bob, 'session-start', 'claude', { session_id: 'bob-via' });
+  assert.match(got, /\n\[1\] 消息 · 来自 alice（本人写的）：限额我刚和交易所确认过：每分钟 20 笔\n/);
+  assert.match(got, /\n\[2\] 消息 · 来自 alice：接口加了必填参数\n\[3\] 消息 · 来自 alice：旧连接器发的\n\[4\] 消息 · 来自 alice：乱填的\n/);
+  // 命令行在测试进程里跑（没有终端）：按 AI 发的算
+  await as(alice, 'notify', '--to', 'bob', '--summary', '命令行发的');
+  assert.equal(engine.store.get<{ via: string | null }>('SELECT via FROM notices WHERE id = ?', latestNotice().id)?.via, 'ai');
+  assert.match(await postTool(bob, 'bob-via'), /\n\[1\] 消息 · 来自 alice：命令行发的\n/);
+});
+
+// —— HTTPS ——
+
+/** 用 openssl 造一张 localhost 的自签证书；机器上没有 openssl 时返回 null。 */
+function selfSigned(dir: string): { cert: string; key: string } | null {
+  mkdirSync(dir, { recursive: true });
+  const cert = join(dir, 'cert.pem');
+  const key = join(dir, 'key.pem');
+  const r = spawnSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '2', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,DNS:*.example.com'], { stdio: 'ignore' });
+  return r.status === 0 && existsSync(cert) && existsSync(key) ? { cert, key } : null;
+}
+
+/** 不验证书的 HTTPS GET（自签证书）。 */
+function tlsGet(url: string, headers: Record<string, string> = {}): Promise<{ status: number; body: string }> {
+  return new Promise((ok, fail) => {
+    const req = httpsRequest(url, { method: 'GET', rejectUnauthorized: false, headers }, (res) => {
+      let body = '';
+      res.on('data', (d) => (body += d));
+      res.on('end', () => ok({ status: res.statusCode ?? 0, body }));
+    });
+    req.on('error', fail);
+    req.end();
+  });
+}
+
+test('HTTPS：start 给了 --cert 和 --key 就走 HTTPS，安装脚本里的服务器地址也是 https；只给一个报错；接入命令按证书上的域名打印', async (t) => {
+  const tls = selfSigned(join(tmp, 'tls'));
+  if (!tls) return t.skip('这台机器上没有 openssl');
+  assert.deepEqual(certNames(readFileSync(tls.cert, 'utf8')), ['localhost'], '通配符的不算');
+  const e = openEngine(join(tmp, 'tls-server'), { log: () => {} });
+  const s = await startServer({ engine: e, port: 0, tls });
+  try {
+    assert.match(s.url, /^https:\/\//);
+    const port = new URL(s.url).port;
+    const health = await tlsGet(`https://localhost:${port}/healthz`);
+    assert.equal(health.status, 200);
+    assert.deepEqual(JSON.parse(health.body), { ok: true, protocol: PROTOCOL });
+    const script = await tlsGet(`https://localhost:${port}/install.sh`);
+    assert.match(script.body, new RegExp(`\\nSERVER="https://localhost:${port}"\\n`));
+    // 明文 HTTP 连不上这个端口
+    await assert.rejects(fetch(`http://localhost:${port}/healthz`));
+  } finally {
+    await s.close();
+    e.store.db.close();
+  }
+  const dir = join(tmp, 'tls-cli');
+  const one = await run(process.execPath, [SERVER_BIN, 'start', '--port', '0', '--data', dir, '--cert', tls.cert]);
+  assert.equal(one.code, 1);
+  assert.match(one.err, /--cert 和 --key 要一起给/);
+  const bad = await run(process.execPath, [SERVER_BIN, 'start', '--port', '0', '--data', dir, '--cert', join(tmp, 'nope.pem'), '--key', tls.key]);
+  assert.equal(bad.code, 1);
+  assert.match(bad.err, /读不了证书文件/);
+  const started = await run(process.execPath, [SERVER_BIN, 'start', '--port', '0', '--data', dir, '--cert', tls.cert, '--key', tls.key], { until: /NODE_EXTRA_CA_CERTS/ });
+  assert.match(started.out, /teamlink 服务器已启动，监听 127\.0\.0\.1:\d+（协议版本 2，HTTPS）/);
+  assert.match(started.out, /curl -fsSL https:\/\/localhost:\d+\/install\.sh \| bash -s -- --invite 邀请码 --name 名字/);
+});
+
+// —— 从上一版升级 ——
+
+/** 上一版（结构版本 2）的表结构：没有 acked_at、attempts、via。 */
+const SCHEMA_V2 = `
+CREATE TABLE members (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, git_email TEXT, handle TEXT, created_at TEXT NOT NULL);
+CREATE TABLE devices (id TEXT PRIMARY KEY, member_id TEXT NOT NULL, public_key TEXT NOT NULL, name TEXT, created_at TEXT NOT NULL);
+CREATE TABLE invites (code TEXT PRIMARY KEY, created_at TEXT NOT NULL, used_by TEXT);
+CREATE TABLE repos (id TEXT PRIMARY KEY, url TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE sessions (id TEXT PRIMARY KEY, member_id TEXT NOT NULL, repo_id TEXT NOT NULL, tool TEXT NOT NULL, started_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, ended_at TEXT);
+CREATE TABLE notices (
+  id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, sender_member_id TEXT NOT NULL, sender_session_id TEXT,
+  type TEXT NOT NULL CHECK (type IN ('message', 'question', 'answer')), summary TEXT NOT NULL,
+  claims TEXT NOT NULL DEFAULT '[]', to_names TEXT NOT NULL DEFAULT '[]', reply_to TEXT, client_id TEXT,
+  created_at TEXT NOT NULL, UNIQUE (sender_member_id, client_id)
+);
+CREATE TABLE recipients (notice_id TEXT NOT NULL, member_id TEXT NOT NULL, delivered_at TEXT, delivered_session TEXT, PRIMARY KEY (notice_id, member_id));
+PRAGMA user_version = 2;
+`;
+
+test('升级：上一版（结构版本 2）的库原地加列升到 3——成员、消息都在；升级前送达的算确认过、不重发，没送达的照常送到；几个进程同时打开也只升一次', async () => {
+  const dir = join(tmp, 'upgrade-v2');
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, 'teamlink.db');
+  const keys = generateDeviceKeys();
+  const now = new Date().toISOString();
+  const db = new DatabaseSync(path);
+  db.exec(SCHEMA_V2);
+  db.exec(`
+    INSERT INTO members (id, name, created_at) VALUES ('m_ming', '阿明', '${now}'), ('m_lili', '丽丽', '${now}');
+    INSERT INTO repos (id, url, created_at) VALUES ('r_1', 'git@example.com:team/up.git', '${now}');
+    INSERT INTO notices (id, repo_id, sender_member_id, type, summary, created_at) VALUES
+      ('n_old_done', 'r_1', 'm_ming', 'message', '升级前已经送到的', '${now}'),
+      ('n_old_mid', 'r_1', 'm_ming', 'message', '升级以后、旧服务器还在跑的时候送到的', '${now}'),
+      ('n_old_wait', 'r_1', 'm_ming', 'message', '升级前还没送到的', '${now}');
+    INSERT INTO recipients (notice_id, member_id, delivered_at, delivered_session) VALUES
+      ('n_old_done', 'm_lili', '${now}', 'codex:old'),
+      ('n_old_mid', 'm_lili', NULL, NULL),
+      ('n_old_wait', 'm_lili', NULL, NULL);
+  `);
+  db.prepare("INSERT INTO devices (id, member_id, public_key, created_at) VALUES ('d_lili', 'm_lili', ?, ?)").run(keys.publicKey, now);
+  db.close();
+
+  // 几个管理命令同时打开：都成功，只有一个去升级
+  const runs = await Promise.all([0, 1, 2].map(() => run(process.execPath, [SERVER_BIN, 'invite', '--data', dir])));
+  for (const r of runs) assert.equal(r.code, 0, r.out + r.err);
+  assert.equal(runs.filter((r) => r.err.includes('数据库已升级到结构版本 3')).length, 1);
+  assert.equal(userVersion(path), SCHEMA_VERSION);
+  assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith('.bak')), [], '只加列，不用备份');
+
+  // 库升级了、上一版的服务器进程还在跑：它送达时只记 delivered_at，不加次数、不确认（下面是它用的那句 SQL）
+  const old = new DatabaseSync(path);
+  old.prepare("UPDATE recipients SET delivered_at = ?, delivered_session = ? WHERE notice_id = 'n_old_mid' AND member_id = 'm_lili' AND delivered_at IS NULL").run(now, 'codex:old');
+  old.close();
+
+  const e = openEngine(dir, { log: () => {} });
+  const s = await startServer({ engine: e, port: 0 });
+  try {
+    const cols = (table: string) => e.store.all<{ name: string }>(`PRAGMA table_info(${table})`).map((c) => c.name);
+    assert.ok(cols('recipients').includes('acked_at') && cols('recipients').includes('attempts'));
+    assert.ok(cols('notices').includes('via'));
+    assert.deepEqual(
+      e.store.all<{ notice_id: string; acked: number; attempts: number }>('SELECT notice_id, acked_at IS NOT NULL AS acked, attempts FROM recipients ORDER BY notice_id').map((r) => ({ ...r })),
+      [
+        { notice_id: 'n_old_done', acked: 1, attempts: 1 },
+        { notice_id: 'n_old_mid', acked: 1, attempts: 1 },
+        { notice_id: 'n_old_wait', acked: 0, attempts: 0 },
+      ],
+    );
+    const lili = { deviceId: 'd_lili', privateKey: keys.privateKey };
+    const start = await signedAt(s.url, lili, 'POST', '/api/v2/sessions/start', { repoId: 'r_1', tool: 'codex', sessionId: 'lili-up', acks: [] });
+    assert.deepEqual(start.body.ids, ['n_old_wait'], '只送还没送到的那条：旧服务器送过的不重发');
+    assert.match(start.body.text, /\n\[1\] 消息 · 来自 阿明：升级前还没送到的\n/);
+  } finally {
+    await s.close();
+    e.store.db.close();
+  }
 });

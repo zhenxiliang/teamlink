@@ -1,13 +1,14 @@
-// 数据存储：Node 自带的 SQLite，零安装。结构版本记在 PRAGMA user_version：旧库是 0，现在的结构是 2。
+// 数据存储：Node 自带的 SQLite，零安装。结构版本记在 PRAGMA user_version：最早的旧库是 0，上一版是 2，现在的结构是 3。
 // 打开库时先迁移、再建表；迁移失败就回滚、报错，不带着旧结构继续跑。
+// 2 → 3 只加列（送达确认 acked_at、交出次数 attempts、消息来源 via），原地做，不用备份。
 
 import { randomBytes } from 'node:crypto';
 import { existsSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
-import type { Claim, NoticeType, Tool } from '../shared/protocol.ts';
+import type { Claim, NoticeType, NoticeVia, Tool } from '../shared/protocol.ts';
 import { claimError, MAX_CLAIMS, MAX_SUMMARY_CHARS } from '../shared/protocol.ts';
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** members、devices、invites 沿用旧表（git_email、handle 这些可空列留着不用）。 */
 const SCHEMA = `
@@ -29,16 +30,18 @@ CREATE TABLE IF NOT EXISTS notices (
   id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, sender_member_id TEXT NOT NULL, sender_session_id TEXT,
   type TEXT NOT NULL CHECK (type IN ('message', 'question', 'answer')), summary TEXT NOT NULL,
   claims TEXT NOT NULL DEFAULT '[]', to_names TEXT NOT NULL DEFAULT '[]', reply_to TEXT, client_id TEXT,
-  created_at TEXT NOT NULL,
+  created_at TEXT NOT NULL, via TEXT,
   UNIQUE (sender_member_id, client_id)
 );
 CREATE INDEX IF NOT EXISTS notices_session ON notices(sender_session_id, created_at);
 CREATE INDEX IF NOT EXISTS notices_created ON notices(created_at);
 CREATE TABLE IF NOT EXISTS recipients (
   notice_id TEXT NOT NULL, member_id TEXT NOT NULL, delivered_at TEXT, delivered_session TEXT,
+  acked_at TEXT, attempts INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (notice_id, member_id)
 );
 CREATE INDEX IF NOT EXISTS recipients_member ON recipients(member_id, delivered_at);
+CREATE INDEX IF NOT EXISTS recipients_unacked ON recipients(member_id, acked_at);
 `;
 
 /** 升级时整个删掉的旧表（git 分析、告警、审计、订阅、活动记录，以及要换结构的会话和通知）。 */
@@ -86,13 +89,22 @@ export interface Notice {
   /** 连接器给每条消息生成的编号：发件箱重发、回复丢失后重试时按它去重。 */
   client_id: string | null;
   created_at: string;
+  /** 谁写的：AI 会话里发的，还是本人在终端里写的；旧连接器发的为 null。 */
+  via: NoticeVia | null;
 }
-/** 送达时一次查出来的一条：通知本身，加上发送人的名字，以及回答对应的提问内容和提问时的会话。 */
+/**
+ * 送达时一次查出来的一条：通知本身，加上发送人的名字、回答对应的提问内容和提问时的会话，
+ * 以及这个收件人的送达情况（交出去过没有、交给了哪个会话、交了几次）。
+ */
 export interface QueuedNotice extends Notice {
   sender_name: string | null;
   question: string | null;
   /** 回答：提问是从哪个会话发的（“工具:会话号”）。 */
   asker_session: string | null;
+  /** 最近一次交出去的时间；还没交出去过为 null。 */
+  delivered_at: string | null;
+  delivered_session: string | null;
+  attempts: number;
 }
 
 export interface MigrationResult {
@@ -174,9 +186,14 @@ export class Store {
     const version = this.userVersion();
     if (version === SCHEMA_VERSION) {
       this.db.exec(SCHEMA);
+      this.adoptOldDeliveries();
       return null;
     }
-    if (version !== 0) throw new Error(`数据库的结构版本是 ${version}，这个版本的服务器只认 0 和 ${SCHEMA_VERSION}；请换用对应版本的服务器`);
+    if (version === 2) {
+      this.upgradeFromV2();
+      return null;
+    }
+    if (version !== 0) throw new Error(`数据库的结构版本是 ${version}，这个版本的服务器只认 0、2 和 ${SCHEMA_VERSION}；请换用对应版本的服务器`);
     // 先拿写锁再读一次版本：服务器和管理命令同时打开旧库时，只有拿到锁的那个去备份和迁移，其余的等它做完、直接用新结构。
     // 以前是拿锁之前就备份，几个进程会各备份一份，还会同时写同一个备份文件，后到的报“备份失败”退出
     this.db.exec('PRAGMA busy_timeout = 30000');
@@ -198,6 +215,41 @@ export class Store {
       if (e instanceof BackupError) throw e;
       // 已回滚，库没变，这次的备份没用了：删掉。否则 run.sh 每 3 秒重启一次，每次多一份整库副本，能把磁盘写满
       if (backup) rmSync(backup, { force: true });
+      throw new Error(`数据库升级失败，已回滚，库保持原样（${this.path}）：${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      this.db.exec('PRAGMA busy_timeout = 3000');
+    }
+  }
+
+  /**
+   * 库升级以后，上一版的服务器进程可能还跑过一阵（比如新版的管理命令先打开了库）：它交出消息时只记 delivered_at，
+   * 不加次数、也不会确认。这一版交出时次数至少是 1，所以“交出去了、次数还是 0”的就是它送的：算确认过，不重发。
+   */
+  private adoptOldDeliveries(): void {
+    this.run('UPDATE recipients SET acked_at = delivered_at, attempts = 1 WHERE delivered_at IS NOT NULL AND acked_at IS NULL AND attempts = 0');
+  }
+
+  /**
+   * 上一版的结构（版本 2）→ 现在的结构：只加列，原地做。升级前已经送达的都算确认过，不会重发。
+   * 先拿写锁再读一次版本：服务器和管理命令同时打开时只做一次。
+   */
+  private upgradeFromV2(): void {
+    this.db.exec('PRAGMA busy_timeout = 30000');
+    try {
+      const done = this.transaction(() => {
+        if (this.userVersion() !== 2) return false;
+        const rc = this.columns('recipients');
+        if (rc.size > 0 && !rc.has('acked_at')) this.db.exec('ALTER TABLE recipients ADD COLUMN acked_at TEXT');
+        if (rc.size > 0 && !rc.has('attempts')) this.db.exec('ALTER TABLE recipients ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
+        const nc = this.columns('notices');
+        if (nc.size > 0 && !nc.has('via')) this.db.exec('ALTER TABLE notices ADD COLUMN via TEXT');
+        this.db.exec(SCHEMA);
+        this.run('UPDATE recipients SET acked_at = delivered_at, attempts = 1 WHERE delivered_at IS NOT NULL AND acked_at IS NULL');
+        this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+        return true;
+      });
+      if (done) this.log(`teamlink：数据库已升级到结构版本 ${SCHEMA_VERSION}（加了送达确认和消息来源），原有的成员和消息都在。`);
+    } catch (e) {
       throw new Error(`数据库升级失败，已回滚，库保持原样（${this.path}）：${e instanceof Error ? e.message : String(e)}`);
     } finally {
       this.db.exec('PRAGMA busy_timeout = 3000');
@@ -281,6 +333,7 @@ export class Store {
           reply_to: typeof r.reply_to === 'string' ? r.reply_to : null,
           client_id: typeof r.client_id === 'string' ? r.client_id : null,
           created_at: r.created_at as string,
+          via: null,
         },
         recipients,
       });
@@ -308,7 +361,16 @@ export class Store {
       k.notice.repo_id = keptRepo.get(k.notice.repo_id) ?? k.notice.repo_id;
       this.insertNotice(k.notice, []);
       for (const x of k.recipients) {
-        this.run('INSERT INTO recipients (notice_id, member_id, delivered_at, delivered_session) VALUES (?, ?, ?, ?)', k.notice.id, x.member_id, x.delivered_at, x.delivered_session);
+        // 旧库里已经送达的（只有提问会带过来）算确认过，不重发
+        this.run(
+          'INSERT INTO recipients (notice_id, member_id, delivered_at, delivered_session, acked_at, attempts) VALUES (?, ?, ?, ?, ?, ?)',
+          k.notice.id,
+          x.member_id,
+          x.delivered_at,
+          x.delivered_session,
+          x.delivered_at,
+          x.delivered_at ? 1 : 0,
+        );
       }
     }
     return { kept: kept.length, dropped: total - kept.length, duplicateRepos };
@@ -451,7 +513,7 @@ export class Store {
   /** 写入通知和它的收件人（调用方负责放进事务）。 */
   insertNotice(n: Notice, recipientIds: string[]): Notice {
     this.run(
-      'INSERT INTO notices (id, repo_id, sender_member_id, sender_session_id, type, summary, claims, to_names, reply_to, client_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO notices (id, repo_id, sender_member_id, sender_session_id, type, summary, claims, to_names, reply_to, client_id, created_at, via) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       n.id,
       n.repo_id,
       n.sender_member_id,
@@ -463,6 +525,7 @@ export class Store {
       n.reply_to,
       n.client_id,
       n.created_at,
+      n.via,
     );
     for (const m of recipientIds) this.run('INSERT OR IGNORE INTO recipients (notice_id, member_id) VALUES (?, ?)', n.id, m);
     return n;
@@ -486,7 +549,8 @@ export class Store {
 
   private queued(where: string, order: string, ...params: unknown[]): QueuedNotice[] {
     return this.all(
-      `SELECT n.*, m.name AS sender_name, q.summary AS question, q.sender_session_id AS asker_session
+      `SELECT n.*, m.name AS sender_name, q.summary AS question, q.sender_session_id AS asker_session,
+              r.delivered_at AS delivered_at, r.delivered_session AS delivered_session, r.attempts AS attempts
        FROM recipients r JOIN notices n ON n.id = r.notice_id
        LEFT JOIN members m ON m.id = n.sender_member_id
        LEFT JOIN notices q ON q.id = n.reply_to
@@ -495,10 +559,13 @@ export class Store {
     ).map((row) => this.decodeNotice<QueuedNotice>(row));
   }
 
-  /** 这个成员在这个项目里所有没送达的：提问 → 回答 → 消息，同类按创建时间。 */
+  /**
+   * 这个成员在这个项目里所有还没确认送到的（没交出去过的，和交出去了、连接器还没确认的）：提问 → 回答 → 消息，同类按创建时间。
+   * 交出去过的现在能不能再交、交给谁，由调用方按会话判断。
+   */
   pending(memberId: string, repoId: string): QueuedNotice[] {
     return this.queued(
-      'r.member_id = ? AND n.repo_id = ? AND r.delivered_at IS NULL',
+      'r.member_id = ? AND n.repo_id = ? AND r.acked_at IS NULL',
       "CASE n.type WHEN 'question' THEN 0 WHEN 'answer' THEN 1 ELSE 2 END, n.created_at, n.rowid",
       memberId,
       repoId,
@@ -509,8 +576,22 @@ export class Store {
     return this.queued('r.member_id = ? AND n.repo_id = ? AND n.created_at >= ?', 'n.created_at, n.rowid', memberId, repoId, sinceIso);
   }
 
-  markDelivered(noticeId: string, memberId: string, sessionId: string): void {
-    this.run('UPDATE recipients SET delivered_at = ?, delivered_session = ? WHERE notice_id = ? AND member_id = ? AND delivered_at IS NULL', this.now(), sessionId, noticeId, memberId);
+  /** 交给了某个会话：记下时间、会话，次数加一。confirmed：同时算确认送到（只给不会回确认的旧连接器用）。 */
+  handOut(noticeId: string, memberId: string, sessionId: string, confirmed: boolean): void {
+    const now = this.now();
+    this.run(
+      'UPDATE recipients SET delivered_at = ?, delivered_session = ?, attempts = attempts + 1, acked_at = ? WHERE notice_id = ? AND member_id = ? AND acked_at IS NULL',
+      now,
+      sessionId,
+      confirmed ? now : null,
+      noticeId,
+      memberId,
+    );
+  }
+
+  /** 连接器确认这条已经输出给 AI 了。只认交出去过的；返回这次确认了几条（0 或 1）。 */
+  ack(noticeId: string, memberId: string): number {
+    return this.run('UPDATE recipients SET acked_at = ? WHERE notice_id = ? AND member_id = ? AND delivered_at IS NOT NULL AND acked_at IS NULL', this.now(), noticeId, memberId);
   }
 
   /** 发送限流用：某个会话（没有会话时按成员）sinceIso 之后发了几条。 */

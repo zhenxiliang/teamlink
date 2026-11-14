@@ -1,5 +1,6 @@
 // hook 处理：Claude Code 和 Codex 的 hook 事件名和输出格式几乎相同，共用这一套。
 // 注入的文字由服务器选好条目、渲染好，这里原样转交；本地只在前面拼上补发结果（最多 800 字节）。
+// 送达确认：输出给 AI 以后把这批的通知号记在本地，之后的请求带给服务器；服务器没收到确认的会重发。
 // 任何错误都吞掉、返回空输出（记进 $TEAMLINK_HOME/hook-errors.log）：协作平台出问题时不能卡住 AI 的正常工作。
 
 import { appendFileSync } from 'node:fs';
@@ -12,6 +13,7 @@ import { flushOutbox, renderNotes } from './outbox.ts';
 import { saveReceived } from './received.ts';
 import {
   backoffActive,
+  clearAcks,
   clearBackoff,
   clearSession,
   clearStopMarker,
@@ -19,7 +21,9 @@ import {
   keepRejected,
   logHookError,
   noteHookRun,
+  pendingAcks,
   readStopMarker,
+  saveAcks,
   saveLastSession,
   saveMembers,
   saveNotes,
@@ -27,6 +31,7 @@ import {
   setStopMarker,
   takeNotes,
   type FlushNote,
+  type PendingAcks,
 } from './state.ts';
 
 export type HookEvent = 'session-start' | 'prompt' | 'post-tool' | 'stop' | 'session-end';
@@ -73,10 +78,10 @@ interface Ctx {
   unsaved: FlushNote[];
 }
 
-/** output 立即交给 AI 工具；after 是输出之后才做的本地记账。 */
+/** output 立即交给 AI 工具；after 是输出之后才做的本地记账（记送达确认也在这里：一定在输出之后）。 */
 interface Outcome {
   output: string;
-  after?: () => void;
+  after?: () => void | Promise<void>;
 }
 
 /** 排查用：设置 TEAMLINK_HOOK_LOG=文件路径 后，每次 hook 调用的开始和结束各记一行。 */
@@ -102,7 +107,7 @@ function safely(ctx: Ctx, fn: () => void): void {
  * 跑一次 hook，返回交给 AI 工具的输出（空串表示什么都不输出）。
  * emit：拿到输出就立即调用（命令行用它写 stdout），本地记账放在之后做。
  */
-export async function runHook(event: HookEvent, tool: Tool, stdin: string, fallbackCwd: string, emit?: (out: string) => void): Promise<string> {
+export async function runHook(event: HookEvent, tool: Tool, stdin: string, fallbackCwd: string, emit?: (out: string) => void | Promise<void>): Promise<string> {
   const started = Date.now();
   trace(`${event} ${tool} 开始`);
   let outcome: Outcome = { output: '' };
@@ -111,9 +116,10 @@ export async function runHook(event: HookEvent, tool: Tool, stdin: string, fallb
   } catch (e) {
     logHookError(`${tool} ${event} ${fallbackCwd} ${message(e)}`);
   }
-  if (outcome.output) emit?.(outcome.output);
+  // 等输出真的写出去了再记账：送达确认不能比输出先落地
+  if (outcome.output) await emit?.(outcome.output);
   try {
-    outcome.after?.();
+    await outcome.after?.();
   } catch (e) {
     logHookError(`${tool} ${event} ${message(e)}`);
   }
@@ -165,7 +171,7 @@ async function handle(event: HookEvent, tool: Tool, stdin: string, fallbackCwd: 
     case 'session-start': {
       safely(ctx, () => saveLastSession(dir, tool, sessionId));
       if (!ctx.backoff) await flush(ctx);
-      return delivered(ctx, await post<DeliveryResponse>(ctx, '/api/v2/sessions/start', sessionBody(ctx), ctx.backoff ? SHORT_MS : Infinity));
+      return delivered(ctx, await deliver(ctx, '/api/v2/sessions/start', ctx.backoff ? SHORT_MS : Infinity));
     }
     case 'prompt': {
       // 新的一回合：收尾检查可以再拦一次。本地动作，退避期间也要做
@@ -173,14 +179,14 @@ async function handle(event: HookEvent, tool: Tool, stdin: string, fallbackCwd: 
       safely(ctx, () => saveLastSession(dir, tool, sessionId));
       if (ctx.backoff) return delivered(ctx, null);
       await flush(ctx);
-      return delivered(ctx, await post<DeliveryResponse>(ctx, '/api/v2/activity', sessionBody(ctx)));
+      return delivered(ctx, await deliver(ctx, '/api/v2/activity'));
     }
     case 'post-tool': {
       safely(ctx, () => saveLastSession(dir, tool, sessionId));
       // 退避期间不联网，只交出已经存下的补发结果
       if (ctx.backoff) return delivered(ctx, null);
       await flush(ctx);
-      return delivered(ctx, await post<DeliveryResponse>(ctx, '/api/v2/activity', sessionBody(ctx)));
+      return delivered(ctx, await deliver(ctx, '/api/v2/activity'));
     }
     case 'stop':
       return stop(ctx);
@@ -188,7 +194,9 @@ async function handle(event: HookEvent, tool: Tool, stdin: string, fallbackCwd: 
       // 先清本地标记，再报下线（不受退避限制），用剩下的时间补发
       safely(ctx, () => clearSession(dir, tool, sessionId));
       safely(ctx, () => forgetLastSession(dir, tool, sessionId));
-      await post(ctx, '/api/v2/sessions/end', { tool, sessionId });
+      // 顺带回传确认：最后一批是收尾时交给 AI 的话，确认只能跟着这个请求走
+      const acks = readAcks(ctx);
+      if (await post(ctx, '/api/v2/sessions/end', { tool, sessionId, acks: acks.ids })) safely(ctx, () => clearAcks(acks.files));
       await flush(ctx);
       // 被退回的留到下次开工交给 AI；只是告知的直接丢掉，不留到下一个会话
       safely(ctx, () => keepRejected(dir, takeAll(ctx)));
@@ -263,9 +271,22 @@ function takeAll(ctx: Ctx): FlushNote[] {
   return notes;
 }
 
-/** 送达类请求的请求体。 */
-function sessionBody(ctx: Ctx): Record<string, unknown> {
-  return { repoId: ctx.cfg.repoId, tool: ctx.tool, sessionId: ctx.sessionId };
+/** 已经输出给 AI、还没向服务器确认的通知号；读不了就当没有（服务器过一会儿会重发那一批）。 */
+function readAcks(ctx: Ctx): PendingAcks {
+  try {
+    return pendingAcks(ctx.dir);
+  } catch (e) {
+    logHookError(`${ctx.tool} ${ctx.event} ${ctx.root} 读送达确认失败：${message(e)}`);
+    return { ids: [], files: [] };
+  }
+}
+
+/** 送达类请求：带上会话和送达确认（没有也带空数组，服务器据此知道这个连接器会回确认）；服务器收下以后删掉本地记的。 */
+async function deliver(ctx: Ctx, path: string, capMs = Infinity): Promise<DeliveryResponse | null> {
+  const acks = readAcks(ctx);
+  const resp = await post<DeliveryResponse>(ctx, path, { repoId: ctx.cfg.repoId, tool: ctx.tool, sessionId: ctx.sessionId, acks: acks.ids }, capMs);
+  if (resp) safely(ctx, () => clearAcks(acks.files));
+  return resp;
 }
 
 /** session-start、prompt、post-tool 的输出：补发结果在前，服务器的文字在后。 */
@@ -277,9 +298,22 @@ function delivered(ctx: Ctx, resp: DeliveryResponse | null): Outcome {
   };
 }
 
-/** 输出之后的本地记账：缓存成员名单；送到了消息就存进 received.md（只有队友段、或者只有“已连接”那一句时不存）。 */
-function remember(ctx: Ctx, resp: DeliveryResponse | null): void {
+/**
+ * 输出之后的本地记账：先记送达确认（这批已经输出给 AI 了，之后的请求带给服务器）；缓存成员名单；
+ * 送到了消息就存进 received.md（只有队友段、或者只有“已连接”那一句时不存）。
+ */
+async function remember(ctx: Ctx, resp: DeliveryResponse | null): Promise<void> {
   if (!resp) return;
+  const ids = Array.isArray(resp.ids) ? resp.ids.filter((x): x is string => typeof x === 'string') : [];
+  if (resp.hasMessages && ids.length > 0) {
+    try {
+      saveAcks(ctx.dir, ids);
+    } catch (e) {
+      // 本地记不下（状态目录写不了）：当场向服务器确认，不然这一批会被一遍遍重发
+      logHookError(`${ctx.tool} ${ctx.event} ${ctx.root} 记送达确认失败，改成当场确认：${message(e)}`);
+      await post(ctx, '/api/v2/acks', { acks: ids }, SHORT_MS);
+    }
+  }
   if (Array.isArray(resp.members)) safely(ctx, () => saveMembers(ctx.dir, ctx.cfg.server, resp.members as string[]));
   if (resp.hasMessages) safely(ctx, () => saveReceived(ctx.root, resp.messagesText ?? '', resp.ids?.length ?? 0));
 }
@@ -304,10 +338,13 @@ async function stop(ctx: Ctx): Promise<Outcome> {
   // 本回合已经拦过：两种工具的标记都由 prompt hook（新的一回合）清掉
   const blocked = readStopMarker(dir, tool, sessionId) !== null;
   if (ctx.data.stop_hook_active === true || blocked) {
+    // 这次不能再输出，所以不取新消息；但拦下时交给 AI 的那一批要及时确认，不然会话就此闲着，服务器会以为没送到
+    const acks = readAcks(ctx);
+    if (acks.ids.length > 0 && !ctx.backoff && (await post(ctx, '/api/v2/acks', { acks: acks.ids }, SHORT_MS))) safely(ctx, () => clearAcks(acks.files));
     safely(ctx, () => keepRejected(dir, takeAll(ctx)));
     return { output: '' };
   }
-  const resp = await post<DeliveryResponse>(ctx, '/api/v2/sessions/stop-check', sessionBody(ctx), ctx.backoff ? SHORT_MS : Infinity);
+  const resp = await deliver(ctx, '/api/v2/sessions/stop-check', ctx.backoff ? SHORT_MS : Infinity);
   const notes = takeAll(ctx);
   const rejected = notes.some((n) => n.kind === 'rejected');
   const batch = resp?.hasMessages ? resp : null;
@@ -318,9 +355,9 @@ async function stop(ctx: Ctx): Promise<Outcome> {
   const reason = [renderNotes(notes, false), batch?.text ?? '', stopEnding(types, rejected)].filter(Boolean).join('\n\n');
   return {
     output: JSON.stringify({ decision: 'block', reason }),
-    after: () => {
+    after: async () => {
       safely(ctx, () => setStopMarker(dir, tool, sessionId));
-      remember(ctx, resp);
+      await remember(ctx, resp);
     },
   };
 }

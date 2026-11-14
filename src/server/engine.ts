@@ -1,5 +1,6 @@
 // 核心流程：发消息（校验、审核、入库，只发给发送方点名的人），按成员排队；
-// hook 请求时在同一个同步调用、同一个事务里选条目、渲染整段注入文字、记送达。服务器不读仓库。
+// hook 请求时在同一个同步调用、同一个事务里收确认、选条目、渲染整段注入文字、记成已交出。服务器不读仓库。
+// 送达要连接器确认：交出去以后一直没确认的会重发（见 deliver）。
 
 import { createPublicKey } from 'node:crypto';
 import type {
@@ -8,13 +9,15 @@ import type {
   InboxResponse,
   JoinResponse,
   NoticeType,
+  NoticeVia,
   Presence,
   SendResponse,
   SessionRef,
+  TakeAnswersResponse,
   Teammate,
   Tool,
 } from '../shared/protocol.ts';
-import { claimError, INJECTION_BUDGET_BYTES, MAX_CLAIMS, MAX_SUMMARY_CHARS, memberNameError } from '../shared/protocol.ts';
+import { claimError, INJECTION_BUDGET_BYTES, MAX_ACKS, MAX_CLAIMS, MAX_SUMMARY_CHARS, memberNameError, VIAS } from '../shared/protocol.ts';
 import { normalizeText, renderBatch, type RenderItem } from '../shared/render.ts';
 import { DEFAULT_POLICY, type Policy } from '../shared/rules.ts';
 import { newId, type MemberRow, type Notice, type QueuedNotice, type RepoRow, type Store } from './db.ts';
@@ -27,6 +30,13 @@ const TEAMMATE_WINDOW_MS = 7 * DAY;
 const MAX_TEAMMATES = 8;
 /** inbox --all 看最近 7 天。 */
 const INBOX_WINDOW_MS = 7 * DAY;
+/** ask --wait 当场取走的回答记在这个名下（不是哪一个会话）：这个成员的任何会话都把它当成“交给了自己”。 */
+const WAIT_SESSION = 'cli';
+/**
+ * 一直没确认时，重发的间隔按交出的次数拉长：resendAfterMs 的 1、6、60、360、2160 倍
+ * （默认 10 秒、1 分钟、10 分钟、1 小时，之后每 6 小时）。不设次数上限：没确认就不能算送到，只是越发越慢。
+ */
+const RESEND_BACKOFF = [1, 6, 60, 360, 2160];
 
 export interface EngineConfig {
   dataDir: string;
@@ -39,6 +49,11 @@ export interface EngineConfig {
   budgetBytes: number;
   /** 会话和通知保留多少天。 */
   retentionDays: number;
+  /**
+   * 交出去以后这么久还没收到确认，同一个会话再来时重发（再没确认，间隔逐次拉长，见 RESEND_BACKOFF）。
+   * 要比一次 hook 的时限（3.5 秒）长：Codex 并行跑的几条 hook 里，后到的那条还没带上前一条的确认，不能把同一批再给它一遍。
+   */
+  resendAfterMs: number;
   /** 服务器事件（以前的审计表）和错误写到哪里，默认 stderr。 */
   log: (line: string) => void;
 }
@@ -49,6 +64,7 @@ export const DEFAULT_CONFIG: Omit<EngineConfig, 'dataDir'> = {
   sendWindowMs: 10 * 60_000,
   budgetBytes: INJECTION_BUDGET_BYTES,
   retentionDays: 30,
+  resendAfterMs: 10_000,
   log: (line) => process.stderr.write(`${line}\n`),
 };
 
@@ -76,6 +92,8 @@ export interface SendInput {
   to: string[];
   replyTo: string | null;
   clientId: string | null;
+  /** 谁写的（AI 会话 / 本人在终端）：连接器报的，不认识的值当作没报。 */
+  via?: unknown;
 }
 
 const toItem = (n: QueuedNotice): RenderItem => ({
@@ -85,6 +103,7 @@ const toItem = (n: QueuedNotice): RenderItem => ({
   summary: n.summary,
   claims: n.claims,
   replyTo: n.reply_to ? { id: n.reply_to, question: n.question ?? '' } : null,
+  via: n.via,
 });
 
 export class Engine {
@@ -151,9 +170,27 @@ export class Engine {
 
   // —— 送达 ——
 
+  /** 连接器确认这些已经输出给 AI 了：只认发给这个成员、已经交出去的，别的忽略。 */
+  private confirm(member: MemberRow, acks: string[] | undefined): void {
+    for (const id of (acks ?? []).slice(0, MAX_ACKS)) this.store.ack(id, member.id);
+  }
+
+  /** 只收确认、不送消息：收尾检查拦过一次以后的那次结束不能再输出，但上一批的确认要及时带回来。 */
+  ack(member: MemberRow, acks: string[] | undefined): void {
+    this.store.transaction(() => this.confirm(member, acks));
+  }
+
   /**
-   * 开工、prompt/post-tool、收尾检查共用：建会话或更新活动时间，按预算选条目、渲染、记送达。
+   * 开工、prompt/post-tool、收尾检查共用：建会话或更新活动时间，收确认，按预算选条目、渲染、记成已交出。
    * 全程同步、在一个事务里（Codex 会并行跑几条 hook，不能两条都拿到同一批）。
+   *
+   * 送达确认：交出去的条目要等连接器在之后的请求里确认（acks）才算送到。还没确认的：
+   * - 交给的就是这个会话：过了 resendAfterMs 它再来、还是没确认，说明那一批没到 AI 手里（hook 超时被杀、响应丢了），重发；
+   *   再没确认，间隔逐次拉长，一直发到确认为止（30 天后和别的通知一起清掉）；
+   * - 交给的是这个成员的另一个会话：那个会话还在线就继续等它，结束或下线了才交给现在这个。
+   * 先后：同一个发送人前面有一条交给了这个会话、还没确认时，他后面的不能先到（更正不能比原文先到）——
+   * 那一条刚交出去（可能还在路上）就等它；已经在等下一次重发了，就把它提前、和后面的一起发。
+   * 请求里没有 acks 字段的是旧连接器，不会回确认：照旧交出时就算送到。
    */
   deliver(member: MemberRow, p: DeliverInput): DeliveryResponse {
     this.requireRepo(p.repoId);
@@ -166,13 +203,45 @@ export class Engine {
       if (fresh) this.store.startSession(sessionKey, member.id, p.repoId, p.tool);
       else this.store.touchSession(sessionKey);
       const start = p.kind === 'start' || fresh;
-      // 回答先留给提问的那个会话：它还在线时（同一个人的另一个会话，比如另一个 worktree 里的），这次不给，继续排队
+      // 先收确认，再选条目：这个请求确认掉的不会又被选中
+      this.confirm(member, p.acks);
       const since = this.store.now(-this.config.onlineWindowMs);
-      const pending = this.store.pending(member.id, p.repoId).filter((n) => {
-        if (n.type !== 'answer' || !n.asker_session || n.asker_session === sessionKey) return true;
-        const s = this.store.session(n.asker_session);
+      /** 这个成员在这个仓库里的另一个会话已经不在了（没有、结束了、下线了）。 */
+      const gone = (key: string) => {
+        const s = this.store.session(key);
         return !s || s.member_id !== member.id || s.repo_id !== p.repoId || s.ended_at !== null || s.last_seen_at < since;
-      });
+      };
+      const now = this.store.clock();
+      const resendDelay = (attempts: number) => this.config.resendAfterMs * RESEND_BACKOFF[Math.min(Math.max(attempts, 1), RESEND_BACKOFF.length) - 1];
+      const pending: QueuedNotice[] = [];
+      /** 这些发送人有一条刚交给这个会话、还没确认（可能还在路上）：他后面的先等它。 */
+      const waitFor = new Set<string>();
+      /** 这些发送人有交给这个会话、没确认、还没到重发时间的：他后面有新的要送时，提前一起重发。 */
+      const early = new Map<string, QueuedNotice[]>();
+      for (const n of this.store.pending(member.id, p.repoId)) {
+        const from = n.sender_member_id;
+        if (n.delivered_at !== null) {
+          // 交出去过、还没确认
+          if (n.delivered_session !== sessionKey && n.delivered_session !== WAIT_SESSION) {
+            if (!n.delivered_session || gone(n.delivered_session)) pending.push(n);
+            continue;
+          }
+          const waited = now - Date.parse(n.delivered_at);
+          if (waited >= resendDelay(n.attempts)) pending.push(n);
+          else if (waited < this.config.resendAfterMs) waitFor.add(from);
+          else early.set(from, [...(early.get(from) ?? []), n]);
+          continue;
+        }
+        // 回答先留给提问的那个会话：它还在线时（同一个人的另一个会话，比如另一个 worktree 里的），这次不给，继续排队
+        if (n.type === 'answer' && n.asker_session && n.asker_session !== sessionKey && !gone(n.asker_session)) continue;
+        if (waitFor.has(from)) continue;
+        const held = early.get(from);
+        if (held) {
+          pending.push(...held);
+          early.delete(from);
+        }
+        pending.push(n);
+      }
       const names = this.store.members().map((m) => m.name);
       const teammates = start ? this.teammates(member.id, p.repoId) : [];
       const batch = renderBatch({
@@ -184,9 +253,12 @@ export class Engine {
         budgetBytes: this.config.budgetBytes,
         now: this.store.clock(),
       });
-      // 只把放进去的记成已送达，其余继续排队
+      // 只把放进去的记成已交出，其余继续排队。旧连接器不回确认：当场算送到
       const sent = pending.slice(0, batch.included);
-      for (const n of sent) this.store.markDelivered(n.id, member.id, sessionKey);
+      const legacy = p.acks === undefined;
+      for (const n of sent) this.store.handOut(n.id, member.id, sessionKey, legacy);
+      const resent = sent.filter((n) => n.attempts > 0);
+      if (resent.length > 0) this.event('notice_resent', { to: member.name, session: sessionKey, ids: resent.map((n) => n.id) });
       return {
         text: batch.text,
         messagesText: batch.messagesText,
@@ -199,12 +271,40 @@ export class Engine {
     });
   }
 
-  endSession(member: MemberRow, tool: Tool, sessionId: string): void {
+  /** 会话结束。顺带收确认：最后一批是在收尾时交给 AI 的话，确认只能跟着这个请求来。没确认的，这个成员的下一个会话会收到。 */
+  endSession(member: MemberRow, tool: Tool, sessionId: string, acks?: string[]): void {
     const key = `${tool}:${sessionId}`;
-    const s = this.store.session(key);
-    if (!s) return;
-    if (s.member_id !== member.id) throw new ApiError(403, '不能结束别人的会话');
-    this.store.endSession(key);
+    this.store.transaction(() => {
+      this.confirm(member, acks);
+      const s = this.store.session(key);
+      if (!s) return;
+      if (s.member_id !== member.id) throw new ApiError(403, '不能结束别人的会话');
+      this.store.endSession(key);
+    });
+  }
+
+  /**
+   * ask --wait 用：取走某条提问已经到了的回答。和 hook 一样要确认：命令行打印出来以后回 /api/v2/acks，这才算送到；
+   * 响应丢了、命令在打印前被杀了，下一次轮询还能再拿到，一直没确认的由 hook 重发。
+   * 只拿没交出去过的和上次 --wait 拿走还没确认的：已经交给 hook 的那一份由 hook 负责。提问必须是这个成员自己发的。
+   */
+  takeAnswers(member: MemberRow, p: { repoId: string; question: string }): TakeAnswersResponse {
+    this.requireRepo(p.repoId);
+    const q = this.store.notice(p.question);
+    if (!q || q.repo_id !== p.repoId || q.type !== 'question') throw new ApiError(404, `找不到提问 ${normalizeText(p.question, true).slice(0, 40)}`);
+    if (q.sender_member_id !== member.id) throw new ApiError(403, '只能等自己发的提问的回答');
+    return this.store.transaction(() => {
+      const answers = this.store
+        .pending(member.id, p.repoId)
+        .filter((n) => n.type === 'answer' && n.reply_to === q.id && (n.delivered_at === null || n.delivered_session === WAIT_SESSION));
+      for (const n of answers) this.store.handOut(n.id, member.id, WAIT_SESSION, false);
+      const asked = this.store.recipientIds(q.id);
+      return {
+        text: answers.length > 0 ? renderBatch({ items: answers.map(toItem), budgetBytes: Infinity, now: this.store.clock() }).text : '',
+        ids: answers.map((n) => n.id),
+        online: asked.some((id) => this.presence(id, p.repoId).online),
+      };
+    });
   }
 
   // —— 发消息 ——
@@ -244,6 +344,7 @@ export class Engine {
     if (summary.trim() === '' && (type !== 'message' || claims.length === 0)) throw new ApiError(400, type === 'message' ? '缺少说明（--summary）' : '缺少内容');
 
     const { to, replyTo } = type === 'answer' ? this.answerTarget(member, repo.id, input.replyTo as string) : { to: this.namedRecipients(member, input.to), replyTo: null };
+    const via: NoticeVia | null = VIAS.includes(input.via as NoticeVia) ? (input.via as NoticeVia) : null;
 
     const reasons = reviewMessage([summary, ...claims.map((c) => `${c.file}#${c.symbol}`)], this.policy().allowDomains);
     if (reasons.length > 0) {
@@ -274,11 +375,12 @@ export class Engine {
           reply_to: replyTo,
           client_id: input.clientId,
           created_at: this.store.now(),
+          via,
         },
         to.map((m) => m.id),
       ),
     );
-    this.event('notice_sent', { id: n.id, type, from: member.name, to: n.to_names });
+    this.event('notice_sent', { id: n.id, type, from: member.name, to: n.to_names, ...(via ? { via } : {}) });
     return this.sendResult(n);
   }
 
@@ -348,10 +450,13 @@ export class Engine {
 
   // —— 查看 ——
 
-  /** teamlink inbox：只看，不记送达，不受注入预算限制。默认看没送到的，all 看最近 7 天的全部。 */
+  /**
+   * teamlink inbox：只看，不记送达，不受注入预算限制。默认看还没交给过 AI 会话的
+   * （交出去了、还在等确认的不算：多半已经在 AI 手里，没到的会自动重发），all 看最近 7 天的全部。
+   */
   inbox(member: MemberRow, repoId: string, all: boolean): InboxResponse {
     this.requireRepo(repoId);
-    const rows = all ? this.store.received(member.id, repoId, this.store.now(-INBOX_WINDOW_MS)) : this.store.pending(member.id, repoId);
+    const rows = all ? this.store.received(member.id, repoId, this.store.now(-INBOX_WINDOW_MS)) : this.store.pending(member.id, repoId).filter((n) => n.delivered_at === null);
     if (rows.length === 0) return { text: all ? '最近 7 天没有收到消息。' : '没有还没送到的消息。', count: 0 };
     return { text: renderBatch({ items: rows.map(toItem), budgetBytes: Infinity, now: this.store.clock() }).text, count: rows.length };
   }

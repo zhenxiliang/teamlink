@@ -6,7 +6,7 @@
 #   ~/teamlink/releases/    每次部署一个目录，保留最近 5 个
 #   ~/teamlink/app          指向当前版本
 #   ~/teamlink/data/        数据库和团队策略（升级时保留；从旧版升级时，旧库备份成 teamlink.db.v1.bak）
-#   ~/teamlink/env          端口、监听地址（第一次生成，之后保留你的修改）
+#   ~/teamlink/env          端口、监听地址（第一次生成，之后保留你的修改）；要开 HTTPS 就加两行 CERT=证书路径、KEY=私钥路径
 #   ~/teamlink/server.log   运行日志
 set -euo pipefail
 
@@ -31,9 +31,11 @@ BASE=$HOME/teamlink
 exec 9>"$BASE/run.lock"
 flock -n 9 || { echo "teamlink 已经在运行"; exit 0; }
 while true; do
+  CERT=; KEY=
   . "$BASE/env"
   echo "$(date '+%F %T') 启动 teamlink（版本 $(basename "$(readlink "$BASE/app")")）"
-  "$BASE/node/bin/node" "$BASE/app/bin/teamlink-server.js" start --data "$BASE/data" --host "$HOST" --port "$PORT"
+  # env 里写了 CERT 和 KEY 就开 HTTPS
+  "$BASE/node/bin/node" "$BASE/app/bin/teamlink-server.js" start --data "$BASE/data" --host "$HOST" --port "$PORT" ${CERT:+--cert "$CERT"} ${KEY:+--key "$KEY"}
   echo "$(date '+%F %T') teamlink 退出（代码 $?），3 秒后重启"
   sleep 3
 done
@@ -90,14 +92,17 @@ else
 fi
 
 . "$BASE/env"
+# 开了 HTTPS 时本机探活也走 https；证书是签给域名的，对 127.0.0.1 不验证书（-k）
+SCHEME=http
+if [ -n "${CERT:-}" ] && [ -n "${KEY:-}" ]; then SCHEME=https; fi
 for _ in $(seq 1 20); do
-  if curl -fsS -m 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
-    echo "== 服务已就绪：端口 $PORT"
+  if curl -fsSk -m 2 "$SCHEME://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+    echo "== 服务已就绪：端口 $PORT（$SCHEME）"
     break
   fi
   sleep 1
 done
-curl -fsS -m 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 || { echo "!! 服务没有起来，看看 $BASE/server.log"; tail -20 "$BASE/server.log"; exit 1; }
+curl -fsSk -m 2 "$SCHEME://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 || { echo "!! 服务没有起来，看看 $BASE/server.log"; tail -20 "$BASE/server.log"; exit 1; }
 
 # 只保留最近 5 个版本
 ls -1t "$BASE/releases" | tail -n +6 | while read -r old; do

@@ -11,6 +11,15 @@ export const TOOLS: Tool[] = ['claude', 'codex'];
 /** 只有三类：提问、回答，其余一律是消息。 */
 export type NoticeType = 'message' | 'question' | 'answer';
 
+/**
+ * 这条是谁写的：ai 是 AI 会话里发的，person 是本人在终端里亲手写的（渲染时在名字后面标出来）。
+ * 连接器按运行环境判断（见 connector/origin.ts），服务器只转交、不核实；旧连接器不带这个字段。
+ */
+export type NoticeVia = 'ai' | 'person';
+export const VIAS: NoticeVia[] = ['ai', 'person'];
+/** 本人写的那一条，渲染时跟在发送人名字后面。成员名里不能带它，免得冒充。 */
+export const PERSON_MARK = '（本人写的）';
+
 export type ChangeType = 'added' | 'removed' | 'signature_changed' | 'behavior_changed';
 export const CHANGE_TYPES: ChangeType[] = ['added', 'removed', 'signature_changed', 'behavior_changed'];
 
@@ -46,6 +55,8 @@ export function memberNameError(name: unknown): string | null {
   if (NAME_INVISIBLE.test(name)) return '成员名不能有看不见的字符（零宽字符、方向控制符、标签字符）';
   // 尖括号能拼出边界标签（阿明<team-notices-x>），渲染时被删掉后也会和另一个成员一样
   if (/[<>]/.test(name)) return '成员名不能有尖括号';
+  // AI 发的消息显示出来会和本人亲手写的一样
+  if (name.includes(PERSON_MARK)) return `成员名里不能有${PERSON_MARK}`;
   if ([...name].length > MAX_NAME_CHARS) return `成员名最长 ${MAX_NAME_CHARS} 个字`;
   return null;
 }
@@ -97,11 +108,20 @@ export interface SessionRef {
   repoId: string;
   tool: Tool;
   sessionId: string;
+  /**
+   * 送达确认：hook 已经输出给 AI、还没向服务器确认过的通知号（没有也带空数组）。
+   * 不带这个字段的是旧连接器：服务器照旧在生成响应时就算送达，不重发。
+   */
+  acks?: string[];
 }
 
+/** 一个请求里最多确认这么多条（多出来的留到下一个请求）。 */
+export const MAX_ACKS = 200;
+
 /**
- * 三个送达类接口的响应。服务器在生成这个响应时就把 ids 里的条目记成已送达（给这个会话），
- * 没放进去的继续排队，下次操作时再送。
+ * 三个送达类接口的响应。服务器在生成这个响应时把 ids 里的条目记成“已交出”（给这个会话），没放进去的继续排队，下次操作时再送。
+ * 连接器把这段文字输出给 AI 以后，在下一个请求的 acks 里确认。一直没确认的（hook 超时被杀、响应丢在路上）：
+ * 同一个会话过 10 秒再来时重发，再没确认就隔得越来越久地重发，直到确认；那个会话结束或下线了，交给这个成员的下一个会话。
  */
 export interface DeliveryResponse {
   /** 渲染好的整段注入文字，原样交给 AI；可能为空串。 */
@@ -133,7 +153,20 @@ export interface SendResponse {
   presence: Presence[];
 }
 
-/** GET /api/v2/inbox?repoId=…[&all=1]：只看，不记送达，不受注入预算限制。默认看没送到的，all=1 看最近 7 天的全部。 */
+/**
+ * POST /api/v2/answers/take：ask --wait 用。取走某条提问已经到了的回答；命令行打印以后回 POST /api/v2/acks { acks } 确认，
+ * 没确认的下一次轮询还能再拿到，之后由 hook 重发。请求体：{ repoId, question }；提问必须是自己发的。
+ */
+export interface TakeAnswersResponse {
+  /** 渲染好的回答（带边界标签和开头说明）；还没有回答时为空串。 */
+  text: string;
+  /** 取走的回答的通知号。 */
+  ids: string[];
+  /** 被问的人现在在不在线：不在线了就不用再等。 */
+  online: boolean;
+}
+
+/** GET /api/v2/inbox?repoId=…[&all=1]：只看，不记送达，不受注入预算限制。默认看还没交给过 AI 会话的，all=1 看最近 7 天的全部。 */
 export interface InboxResponse {
   /** 渲染好的文字（带边界标签）；没有消息时是一句说明。 */
   text: string;
