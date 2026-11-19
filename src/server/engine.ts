@@ -3,6 +3,8 @@
 // 送达要连接器确认：交出去以后一直没确认的会重发（见 deliver）。
 
 import { createPublicKey } from 'node:crypto';
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import type {
   Claim,
   DeliveryResponse,
@@ -30,6 +32,8 @@ const TEAMMATE_WINDOW_MS = 7 * DAY;
 const MAX_TEAMMATES = 8;
 /** inbox --all 看最近 7 天。 */
 const INBOX_WINDOW_MS = 7 * DAY;
+/** 每天的备份文件名。 */
+const BACKUP_FILE = /^teamlink-\d{4}-\d\d-\d\d\.db$/;
 /** 告诉发送人“这些没送到、已经删了”时，一条系统消息里最多列几条、每条列几个收件人、摘录几个字。 */
 const TOLD_MAX = 5;
 const TOLD_NAMES = 3;
@@ -56,6 +60,8 @@ export interface EngineConfig {
   budgetBytes: number;
   /** 会话和通知保留多少天。 */
   retentionDays: number;
+  /** 每天备份一次数据库，保留最近几份；0 是不备份。 */
+  backupKeep: number;
   /**
    * 交出去以后这么久还没收到确认，同一个会话再来时重发（再没确认，间隔逐次拉长，见 RESEND_BACKOFF）。
    * 要比一次 hook 的时限（3.5 秒）长：Codex 并行跑的几条 hook 里，后到的那条还没带上前一条的确认，不能把同一批再给它一遍。
@@ -72,6 +78,7 @@ export const DEFAULT_CONFIG: Omit<EngineConfig, 'dataDir'> = {
   sendWindowMs: 10 * 60_000,
   budgetBytes: INJECTION_BUDGET_BYTES,
   retentionDays: 30,
+  backupKeep: 7,
   resendAfterMs: 10_000,
   log: (line) => process.stderr.write(`${line}\n`),
 };
@@ -584,6 +591,33 @@ export class Engine {
     const rows = all ? this.store.received(member.id, repoId, this.store.now(-INBOX_WINDOW_MS)) : this.store.pending(member.id, repoId).filter((n) => n.delivered_at === null);
     if (rows.length === 0) return { text: all ? '最近 7 天没有收到消息。' : '没有还没送到的消息。', count: 0 };
     return { text: renderBatch({ items: rows.map(toItem), budgetBytes: Infinity, now: this.store.clock() }).text, count: rows.length };
+  }
+
+  // —— 备份 ——
+
+  /**
+   * 每天备份一次数据库：<数据目录>/backups/teamlink-年-月-日.db（按 UTC 的日期），保留最近 backupKeep 份。
+   * 服务器不用停（VACUUM INTO 写出的是一份一致的快照）。今天的已经有了就不做。返回新备份的路径，没做返回 null。
+   */
+  backup(): string | null {
+    if (this.config.backupKeep <= 0 || this.store.path === ':memory:') return null;
+    const dir = join(this.config.dataDir, 'backups');
+    const target = join(dir, `teamlink-${this.store.now().slice(0, 10)}.db`);
+    if (existsSync(target)) return null;
+    mkdirSync(dir, { recursive: true });
+    // 先写临时文件再改名：备份到一半断了（磁盘满、进程被杀），不会留下一个看着完整、其实只有半截的备份
+    const tmp = `${target}.tmp`;
+    rmSync(tmp, { force: true });
+    try {
+      this.store.backupTo(tmp);
+      renameSync(tmp, target);
+    } catch (e) {
+      rmSync(tmp, { force: true });
+      throw e;
+    }
+    const all = readdirSync(dir).filter((f) => BACKUP_FILE.test(f)).sort();
+    for (const f of all.slice(0, -this.config.backupKeep)) rmSync(join(dir, f), { force: true });
+    return target;
   }
 
   // —— 清理 ——

@@ -6,8 +6,9 @@
 #   ~/teamlink/releases/    每次部署一个目录，保留最近 5 个
 #   ~/teamlink/app          指向当前版本
 #   ~/teamlink/data/        数据库和团队策略（升级时保留；从旧版升级时，旧库备份成 teamlink.db.v1.bak）
+#   ~/teamlink/data/backups/  服务器每天自动备份一次数据库，保留最近 7 份
 #   ~/teamlink/env          端口、监听地址（第一次生成，之后保留你的修改）；要开 HTTPS 就加两行 CERT=证书路径、KEY=私钥路径
-#   ~/teamlink/server.log   运行日志
+#   ~/teamlink/server.log   运行日志（超过 10 MB 自动轮转，旧的在 server.log.1 到 .3）
 set -euo pipefail
 
 SHA=${1:?用法：install-server.sh <版本>}
@@ -30,6 +31,17 @@ cat > "$BASE/run.sh.new" <<'EOF'
 BASE=$HOME/teamlink
 exec 9>"$BASE/run.lock"
 flock -n 9 || { echo "teamlink 已经在运行"; exit 0; }
+# 日志轮转：每小时看一次，server.log 超过 10 MB 就另存成 server.log.1（保留 3 份）再清空。
+# 这个后台循环要先关掉 9 号描述符：不然它一直占着 run.lock，run.sh 退出以后新的起不来。
+(
+  exec 9>&-
+  while true; do
+    "$BASE/app/deploy/rotate-log.sh" "$BASE/server.log" || true
+    sleep 3600
+  done
+) &
+ROTATE=$!
+trap 'kill "$ROTATE" 2>/dev/null' EXIT
 while true; do
   CERT=; KEY=
   . "$BASE/env"

@@ -31,7 +31,7 @@ export interface RunningServer {
   drain: () => Promise<void>;
 }
 
-/** 启动时清理一次过期的会话和通知，之后每小时一次。 */
+/** 启动时备份（今天还没备份的话）、清理一次过期的会话和通知，之后每小时一次。 */
 const PRUNE_INTERVAL_MS = 3600_000;
 /** 证书文件每小时看一次：续期后换了内容就重新加载，不用重启服务器。 */
 const CERT_RELOAD_MS = 3600_000;
@@ -86,6 +86,13 @@ export async function startServer(opts: { engine: Engine; port?: number; host?: 
     });
   });
   const prune = () => {
+    // 每小时来一次：今天还没备份就先备份，再清理
+    try {
+      const file = engine.backup();
+      if (file) engine.event('backup', { file });
+    } catch (e) {
+      engine.event('backup_failed', { error: String(e) });
+    }
     try {
       const r = engine.prune();
       if (r.sessions > 0 || r.notices > 0) engine.event('pruned', r);

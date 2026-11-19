@@ -724,6 +724,11 @@ export class Store {
     );
   }
 
+  /** 整库写到 target（目标文件不能已经存在）：一份一致的快照，写的过程中服务器照常读写。不能在事务里调。 */
+  backupTo(target: string): void {
+    this.db.prepare('VACUUM INTO ?').run(target);
+  }
+
   /** 发送限流用：某个会话（没有会话时按成员）sinceIso 之后发了几条。 */
   sentSince(memberId: string, sessionId: string | null, sinceIso: string): number {
     const row = sessionId
