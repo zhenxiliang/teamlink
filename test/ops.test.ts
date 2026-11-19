@@ -35,13 +35,14 @@ test('备份：每天一份、当天不重复，是能直接打开的完整数�
     store.clock = () => t0 + 5 * 3600_000;
     assert.equal(engine.backup(), null, '同一天不再做');
 
-    // 上次做到一半留下的临时文件不算数，也不挡着下一次
+    // 上次做到一半留下的临时文件不算数，也不挡着下一次；别的日子留下的（那天被杀掉、第二天才重启）也一起清掉
     writeFileSync(join(dir, 'backups/teamlink-2026-03-02.db.tmp'), '半截');
+    writeFileSync(join(dir, 'backups/teamlink-2026-02-20.db.tmp'), '半截');
     for (let d = 1; d <= 8; d++) {
       store.clock = () => t0 + d * DAY;
       assert.ok(engine.backup());
     }
-    assert.deepEqual(backups(), ['03', '04', '05', '06', '07', '08', '09'].map((d) => `teamlink-2026-03-${d}.db`));
+    assert.deepEqual(backups(), ['03', '04', '05', '06', '07', '08', '09'].map((d) => `teamlink-2026-03-${d}.db`), '只有最近 7 份，没有留下临时文件');
 
     engine.config.backupKeep = 0;
     store.clock = () => t0 + 20 * DAY;

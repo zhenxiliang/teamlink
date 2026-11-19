@@ -615,8 +615,11 @@ export class Engine {
       rmSync(tmp, { force: true });
       throw e;
     }
-    const all = readdirSync(dir).filter((f) => BACKUP_FILE.test(f)).sort();
-    for (const f of all.slice(0, -this.config.backupKeep)) rmSync(join(dir, f), { force: true });
+    const files = readdirSync(dir);
+    const all = files.filter((f) => BACKUP_FILE.test(f)).sort();
+    // 以前哪天做到一半被杀掉留下的临时文件也删：只有服务器这一个进程做备份，这时候没有别人在写
+    const stale = files.filter((f) => f.endsWith('.tmp') && BACKUP_FILE.test(f.slice(0, -4)));
+    for (const f of [...all.slice(0, -this.config.backupKeep), ...stale]) rmSync(join(dir, f), { force: true });
     return target;
   }
 
