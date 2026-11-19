@@ -2475,7 +2475,7 @@ test('服务器命令：start 带 --poll、--no-dashboard-auth 不报错；init�
   assert.match(start.out, /已忽略 --no-dashboard-auth/);
   assert.match(start.out, /teamlink 服务器已启动，监听 127\.0\.0\.1:\d+（协议版本 2）/);
   assert.doesNotMatch(start.out, /口令/, '不再生成看板口令');
-  assert.match(start.err, /^\S+ stopping \{"signal":"SIGTERM"\}\n$/, '除了收到停止信号的那一行，没有别的输出');
+  assert.match(start.err, /^(\S+ backup \{"file":"[^"]+"\}\n)?\S+ stopping \{"signal":"SIGTERM"\}\n$/, '除了当天的备份和收到停止信号这两行，没有别的输出');
 
   // 旧版 policy.json 里的其他字段（拦截、批准、任务共享……）直接忽略，保存时去掉
   write(dir, 'policy.json', JSON.stringify({ ...DEFAULT_POLICY, block: ['secret_read'], riskyNotices: 'approve', shareTasks: false, notifyOwners: true, massDeleteThreshold: 20 }));
