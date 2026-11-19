@@ -24,13 +24,18 @@ export function openEngine(dataDir: string, overrides: Partial<Omit<EngineConfig
 export interface RunningServer {
   url: string;
   engine: Engine;
+  /** 立刻关：进行中的请求直接断开（测试用）。 */
   close: () => Promise<void>;
+  /** 不再接新请求，等进行中的请求答完。 */
+  drain: () => Promise<void>;
 }
 
 /** 启动时清理一次过期的会话和通知，之后每小时一次。 */
 const PRUNE_INTERVAL_MS = 3600_000;
 /** 证书文件每小时看一次：续期后换了内容就重新加载，不用重启服务器。 */
 const CERT_RELOAD_MS = 3600_000;
+/** 收到停止信号后，最多等这么久让进行中的请求答完。 */
+const STOP_GRACE_MS = 5000;
 
 /** HTTPS 的证书和私钥文件（PEM）。 */
 export interface TlsFiles {
@@ -115,6 +120,14 @@ export async function startServer(opts: { engine: Engine; port?: number; host?: 
       await new Promise<void>((ok) => {
         server.close(() => ok());
         server.closeAllConnections();
+      });
+    },
+    drain: async () => {
+      clearInterval(timer);
+      clearInterval(certTimer);
+      await new Promise<void>((ok) => {
+        server.close(() => ok());
+        server.closeIdleConnections();
       });
     },
   };
@@ -227,6 +240,17 @@ export async function runServerCli(argv: string[]): Promise<void> {
       if (Boolean(values.cert) !== Boolean(values.key)) throw new Error('--cert 和 --key 要一起给：证书文件和它的私钥文件（PEM 格式）');
       const tls = values.cert && values.key ? { cert: resolve(values.cert), key: resolve(values.key) } : undefined;
       const s = await startServer({ engine, port, host: values.host, tls });
+      // 收到停止信号：不再接新请求，等手上的请求答完再退出；5 秒还没答完就直接退
+      let stopping = false;
+      const stop = (signal: NodeJS.Signals) => {
+        if (stopping) return;
+        stopping = true;
+        engine.event('stopping', { signal });
+        setTimeout(() => process.exit(0), STOP_GRACE_MS).unref();
+        void s.drain().then(() => process.exit(0));
+      };
+      process.on('SIGTERM', stop);
+      process.on('SIGINT', stop);
       const actual = new URL(s.url).port;
       console.log(`teamlink 服务器已启动，监听 ${values.host}:${actual}（协议版本 ${PROTOCOL}${tls ? '，HTTPS' : ''}）`);
       if (tls) {

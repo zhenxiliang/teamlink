@@ -28,13 +28,21 @@ if [ "$(remote '~/teamlink/node/bin/node -v 2>/dev/null || true')" != "$NODE_VER
   esac
   TARBALL=node-$NODE_VERSION-linux-$ARCH.tar.xz
   URL=https://nodejs.org/dist/$NODE_VERSION/$TARBALL
+  # 校验值在这台电脑上取：服务器下载的、这台电脑上传的，都要和它对上才解压
+  WANT=$(curl -fsSL -m 60 "https://nodejs.org/dist/$NODE_VERSION/SHASUMS256.txt" | awk -v f="$TARBALL" '$2 == f { print $1 }')
+  if ! [[ "$WANT" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "取不到 $TARBALL 的 SHA256 校验值，已停止部署"
+    exit 1
+  fi
+  # 在服务器上：校验 ~/teamlink/node.tar.xz，对上了才解压、换上
+  UNPACK="set -e; cd ~/teamlink; [ \"\$(sha256sum node.tar.xz | cut -d' ' -f1)\" = $WANT ] || { rm -f node.tar.xz; echo 'Node.js 安装包的 SHA256 校验不通过' >&2; exit 1; }; rm -rf node.tmp; mkdir -p node.tmp; tar -xJf node.tar.xz --strip-components=1 -C node.tmp; rm -rf node; mv node.tmp node; rm -f node.tar.xz"
   echo "== 安装 Node.js $NODE_VERSION 到 ~/teamlink/node"
-  if ! remote "set -e; rm -rf ~/teamlink/node.tmp; mkdir -p ~/teamlink/node.tmp; curl -fsSL -m 300 $URL | tar -xJ --strip-components=1 -C ~/teamlink/node.tmp; rm -rf ~/teamlink/node; mv ~/teamlink/node.tmp ~/teamlink/node"; then
+  if ! remote "set -e; mkdir -p ~/teamlink; curl -fsSL -m 300 -o ~/teamlink/node.tar.xz $URL; $UNPACK"; then
     echo "   服务器下载失败，改为从这台电脑下载后上传"
     CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/teamlink
     mkdir -p "$CACHE"
     [ -f "$CACHE/$TARBALL" ] || curl -fL -o "$CACHE/$TARBALL" "$URL"
-    remote "set -e; rm -rf ~/teamlink/node.tmp; mkdir -p ~/teamlink/node.tmp; tar -xJ --strip-components=1 -C ~/teamlink/node.tmp; rm -rf ~/teamlink/node; mv ~/teamlink/node.tmp ~/teamlink/node" < "$CACHE/$TARBALL"
+    remote "set -e; mkdir -p ~/teamlink; cat > ~/teamlink/node.tar.xz; $UNPACK" < "$CACHE/$TARBALL"
   fi
 fi
 

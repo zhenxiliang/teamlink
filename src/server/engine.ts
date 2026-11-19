@@ -45,6 +45,8 @@ export interface EngineConfig {
   /** 每个会话（没有会话时按成员）在 sendWindowMs 内最多发几条：防失控的兜底。 */
   sendLimit: number;
   sendWindowMs: number;
+  /** 同一个成员的所有会话加起来，在 sendWindowMs 内最多发几条：会话号是连接器自己报的，换会话号不能绕过限流。 */
+  memberSendLimit: number;
   /** 一次注入最多多少字节（UTF-8）。 */
   budgetBytes: number;
   /** 会话和通知保留多少天。 */
@@ -61,6 +63,7 @@ export interface EngineConfig {
 export const DEFAULT_CONFIG: Omit<EngineConfig, 'dataDir'> = {
   onlineWindowMs: 30 * 60_000,
   sendLimit: 30,
+  memberSendLimit: 120,
   sendWindowMs: 10 * 60_000,
   budgetBytes: INJECTION_BUDGET_BYTES,
   retentionDays: 30,
@@ -355,10 +358,13 @@ export class Engine {
     // 发送方的会话属于别人时不算（会话号冲突），按成员限流
     const owner = input.sessionKey ? this.store.session(input.sessionKey)?.member_id : undefined;
     const sessionKey = input.sessionKey && (owner === undefined || owner === member.id) ? input.sessionKey : null;
-    const sent = this.store.sentSince(member.id, sessionKey, this.store.now(-this.config.sendWindowMs));
-    if (sent >= this.config.sendLimit) {
-      const minutes = Math.round(this.config.sendWindowMs / 60_000);
+    const since = this.store.now(-this.config.sendWindowMs);
+    const minutes = Math.round(this.config.sendWindowMs / 60_000);
+    if (this.store.sentSince(member.id, sessionKey, since) >= this.config.sendLimit) {
       throw new ApiError(429, `发送太频繁：同一个会话 ${minutes} 分钟内最多发 ${this.config.sendLimit} 条，请稍后再发`);
+    }
+    if (this.store.sentByMemberSince(member.id, since) >= this.config.memberSendLimit) {
+      throw new ApiError(429, `发送太频繁：同一个人 ${minutes} 分钟内最多发 ${this.config.memberSendLimit} 条，请稍后再发`);
     }
 
     const n = this.store.transaction(() =>

@@ -601,4 +601,9 @@ export class Store {
       : this.get<{ c: number }>('SELECT COUNT(*) AS c FROM notices WHERE sender_member_id = ? AND sender_session_id IS NULL AND created_at >= ?', memberId, sinceIso);
     return row?.c ?? 0;
   }
+
+  /** 发送限流用：某个成员（不分会话）sinceIso 之后发了几条。 */
+  sentByMemberSince(memberId: string, sinceIso: string): number {
+    return this.get<{ c: number }>('SELECT COUNT(*) AS c FROM notices WHERE sender_member_id = ? AND created_at >= ?', memberId, sinceIso)?.c ?? 0;
+  }
 }

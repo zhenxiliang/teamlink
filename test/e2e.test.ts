@@ -2475,7 +2475,7 @@ test('服务器命令：start 带 --poll、--no-dashboard-auth 不报错；init�
   assert.match(start.out, /已忽略 --no-dashboard-auth/);
   assert.match(start.out, /teamlink 服务器已启动，监听 127\.0\.0\.1:\d+（协议版本 2）/);
   assert.doesNotMatch(start.out, /口令/, '不再生成看板口令');
-  assert.equal(start.err, '');
+  assert.match(start.err, /^\S+ stopping \{"signal":"SIGTERM"\}\n$/, '除了收到停止信号的那一行，没有别的输出');
 
   // 旧版 policy.json 里的其他字段（拦截、批准、任务共享……）直接忽略，保存时去掉
   write(dir, 'policy.json', JSON.stringify({ ...DEFAULT_POLICY, block: ['secret_read'], riskyNotices: 'approve', shareTasks: false, notifyOwners: true, massDeleteThreshold: 20 }));
@@ -3068,4 +3068,42 @@ test('升级：上一版（结构版本 2）的库原地加列升到 3——成�
     await s.close();
     e.store.db.close();
   }
+});
+
+test('发送限流：换会话号不能绕过——同一个人所有会话加起来也有上限；别人不受影响', async () => {
+  fresh();
+  const { alice, bob } = devs;
+  const aliceId = engine.store.memberByName('alice')!.id;
+  const already = engine.store.sentByMemberSince(aliceId, engine.store.now(-engine.config.sendWindowMs));
+  const limit = engine.config.memberSendLimit;
+  engine.config.memberSendLimit = already + 2;
+  try {
+    const send = (dev: Dev, sessionId: string) => signed(dev, 'POST', '/api/v2/notices', { repoId, tool: 'codex', sessionId, summary: `限流 ${sessionId}`, to: [dev === alice ? 'bob' : 'alice'] });
+    assert.equal((await send(alice, 'alice-m1')).status, 200);
+    assert.equal((await send(alice, 'alice-m2')).status, 200);
+    const third = await send(alice, 'alice-m3');
+    assert.equal(third.status, 429);
+    assert.match(third.body.error, /^发送太频繁：同一个人 10 分钟内最多发 \d+ 条，请稍后再发$/);
+    assert.equal((await send(alice, 'alice-m1')).status, 429, '回到用过的会话也一样');
+    assert.equal((await send(bob, 'bob-m1')).status, 200);
+  } finally {
+    engine.config.memberSendLimit = limit;
+  }
+});
+
+test('签名：时间戳不是纯数字的请求不接受（不然过期检查形同虚设）', async () => {
+  const id = identity(devs.alice);
+  for (const ts of ['abc', '', '1e3', ` ${Date.now()}`, `${Date.now()}.5`, '-1']) {
+    const res = await fetch(`${server.url}/api/v2/whoami`, {
+      headers: { [PROTOCOL_HEADER]: String(PROTOCOL), 'x-tl-device': id.deviceId, 'x-tl-ts': ts, 'x-tl-sig': signRequest(id.privateKey, 'GET', '/api/v2/whoami', ts, '') },
+    });
+    assert.equal(res.status, 401, `x-tl-ts: ${JSON.stringify(ts)}`);
+  }
+});
+
+test('teamlink-server start：收到 SIGTERM 正常退出（退出码 0），日志里记一行', async () => {
+  const dir = mkdtempSync(join(tmp, 'server-stop-'));
+  const r = await run(process.execPath, [SERVER_BIN, 'start', '--port', '0', '--data', dir], { until: /服务器已启动/ });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.err, /stopping.*SIGTERM/);
 });

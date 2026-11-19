@@ -129,7 +129,8 @@ export function createApi(engine: Engine, tls?: TlsMaterial): Server {
     const ts = req.headers['x-tl-ts'];
     const sig = req.headers['x-tl-sig'];
     if (typeof deviceId !== 'string' || typeof ts !== 'string' || typeof sig !== 'string') throw new ApiError(401, '缺少签名');
-    if (Math.abs(store.clock() - Number(ts)) > CLOCK_SKEW_MS) throw new ApiError(401, '签名已过期，检查本机时间');
+    // 只接受纯数字：别的写法转成 NaN，下面的比较永远不成立，等于不查过期
+    if (!/^\d{1,15}$/.test(ts) || Math.abs(store.clock() - Number(ts)) > CLOCK_SKEW_MS) throw new ApiError(401, '签名已过期，检查本机时间');
     // 只接受标准写法的 base64：Buffer 解码时会忽略空白和多余的补位，换种写法就能绕过下面的防重放
     if (Buffer.from(sig, 'base64').toString('base64') !== sig) throw new ApiError(401, '签名格式不对');
     const device = store.device(deviceId);

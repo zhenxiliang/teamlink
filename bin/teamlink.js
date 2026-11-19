@@ -2,6 +2,7 @@
 // teamlink 命令行入口。先查 Node 版本：teamlink 直接运行 .ts，太旧的 Node 连代码都加载不了，所以这里不能静态 import。
 // 启动脚本（$TEAMLINK_HOME/bin/teamlink）不查版本，由这里查。
 import { appendFileSync, mkdirSync } from 'node:fs';
+import { enableCompileCache } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,6 +22,14 @@ if (major < 23 || (major === 23 && minor < 6)) {
   }
   console.error(`${msg}。重新运行安装脚本，或者把新版 node 的路径写进 ${join(home, 'node-path')}。`);
   process.exit(1);
+}
+
+// 每次 hook 都新起一个进程：把编译结果（包括去掉类型后的 .ts）缓存下来，启动快一半以上。
+// 目录写不了（比如在沙箱里）时 Node 自己放弃缓存，不影响运行。
+try {
+  enableCompileCache(join(process.env.TEAMLINK_HOME || join(homedir(), '.teamlink'), 'compile-cache'));
+} catch {
+  // 缓存开不了就照常运行
 }
 
 const { runCli } = await import('../src/connector/cli.ts');
