@@ -2,6 +2,7 @@
 
 import { X509Certificate } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
+import type { ServerResponse } from 'node:http';
 import type { Server as TlsServer } from 'node:https';
 import type { AddressInfo } from 'node:net';
 import { networkInterfaces } from 'node:os';
@@ -110,12 +111,20 @@ export async function startServer(opts: { engine: Engine; port?: number; host?: 
   };
   const certTimer = setInterval(reload, CERT_RELOAD_MS);
   certTimer.unref();
-  // 停止时：进行中的请求答完就断开它的连接。不然连接按 keep-alive 留着，客户端还能在上面发新请求，drain 也一直等不完
+  // 停止时：进行中的请求答完就断开它自己的连接。不然连接按 keep-alive 留着，客户端还能在上面发新请求，drain 也一直等不完。
+  // 不能用 closeIdleConnections()，server.close() 也要等一等再调（它会顺带调一次）：响应已经 end()、数据还没写完的连接，
+  // Node 也当成空闲的直接断开，读得慢的客户端会收到半截响应。所以先等这样的响应写完
   let draining = false;
-  server.prependListener('request', (_req, res) => {
+  let closeWhenFlushed: (() => void) | null = null;
+  const open = new Set<ServerResponse>();
+  server.prependListener('request', (req, res) => {
+    open.add(res);
     if (draining) res.setHeader('connection', 'close');
     res.once('close', () => {
-      if (draining) server.closeIdleConnections();
+      open.delete(res);
+      if (!draining) return;
+      req.socket.end();
+      closeWhenFlushed?.();
     });
   });
   const addr = server.address() as AddressInfo;
@@ -135,8 +144,12 @@ export async function startServer(opts: { engine: Engine; port?: number; host?: 
       clearInterval(certTimer);
       draining = true;
       await new Promise<void>((ok) => {
-        server.close(() => ok());
-        server.closeIdleConnections();
+        closeWhenFlushed = () => {
+          if ([...open].some((res) => res.writableEnded && !res.writableFinished)) return;
+          closeWhenFlushed = null;
+          server.close(() => ok());
+        };
+        closeWhenFlushed();
       });
     },
   };

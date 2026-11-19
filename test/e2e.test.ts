@@ -3127,3 +3127,46 @@ test('服务器停止（drain）：进行中的请求照常答完，答完就断
   assert.equal(got.match(/HTTP\/1\.1 /g)?.length, 1);
   e.store.db.close();
 });
+
+test('服务器停止（drain）：别的请求答完时，不会把读得慢的客户端还没收完的响应切断', async () => {
+  const e = openEngine(mkdtempSync(join(tmp, 'server-drain-slow-')), { log: () => {} });
+  const repo = e.addRepo('git@example.com:team/drain.git');
+  const keys = generateDeviceKeys();
+  const a = e.join({ invite: e.store.createInvite(), name: 'a', publicKey: keys.publicKey, deviceName: null });
+  const b = e.join({ invite: e.store.createInvite(), name: 'b', publicKey: generateDeviceKeys().publicKey, deviceName: null });
+  // 响应要比本机的套接字缓冲区大（约 6 MB）：服务器 end() 以后还有数据等着写出去
+  e.store.transaction(() => {
+    for (let i = 0; i < 4000; i++) {
+      e.store.insertNotice(
+        { id: `n_drain${i}`, repo_id: repo.id, sender_member_id: b.memberId, sender_session_id: null, type: 'message', summary: '长'.repeat(500), claims: [], to_names: ['a'], reply_to: null, client_id: null, created_at: e.store.now(), via: null },
+        [a.memberId],
+      );
+    }
+  });
+  const s = await startServer({ engine: e, port: 0 });
+  const port = Number(new URL(s.url).port);
+  const path = `/api/v2/inbox?repoId=${repo.id}&all=1`;
+  const ts = String(Date.now());
+  const slow = connect(port, '127.0.0.1');
+  let got = '';
+  slow.setEncoding('utf8');
+  slow.on('data', (d) => (got += d));
+  slow.on('error', () => {});
+  const closed = new Promise<void>((ok) => slow.once('close', () => ok()));
+  slow.pause();
+  slow.write(`GET ${path} HTTP/1.1\r\nHost: x\r\n${PROTOCOL_HEADER}: ${PROTOCOL}\r\nx-tl-device: ${a.deviceId}\r\nx-tl-ts: ${ts}\r\nx-tl-sig: ${signRequest(keys.privateKey, 'GET', path, ts, '')}\r\n\r\n`);
+  // 另一个请求发到一半时开始停止，停止过程中答完
+  const other = connect(port, '127.0.0.1');
+  other.on('error', () => {});
+  other.write(`POST /api/v2/join HTTP/1.1\r\nHost: x\r\n${PROTOCOL_HEADER}: ${PROTOCOL}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{`);
+  await sleep(300);
+  const drained = s.drain();
+  await sleep(50);
+  other.write('}');
+  await sleep(200);
+  slow.resume();
+  await Promise.all([closed, drained]);
+  assert.match(got, /^HTTP\/1\.1 200 /);
+  assert.ok(got.endsWith('\r\n0\r\n\r\n'), `慢的客户端收到的响应不完整（${Buffer.byteLength(got)} 字节）`);
+  e.store.db.close();
+});
