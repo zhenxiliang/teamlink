@@ -9,7 +9,7 @@ import { createServer as createTlsServer } from 'node:https';
 import type { TLSSocket } from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { verifyRequest } from '../shared/crypto.ts';
-import { PROTOCOL, PROTOCOL_HEADER, TOOLS, type LegacyInboxResponse, type Tool } from '../shared/protocol.ts';
+import { DEVICE_UNKNOWN, PROTOCOL, PROTOCOL_HEADER, TOOLS, type LegacyInboxResponse, type Tool } from '../shared/protocol.ts';
 import type { DeviceRow, MemberRow } from './db.ts';
 import { ApiError, type Engine } from './engine.ts';
 
@@ -134,7 +134,9 @@ export function createApi(engine: Engine, tls?: TlsMaterial): Server {
     // 只接受标准写法的 base64：Buffer 解码时会忽略空白和多余的补位，换种写法就能绕过下面的防重放
     if (Buffer.from(sig, 'base64').toString('base64') !== sig) throw new ApiError(401, '签名格式不对');
     const device = store.device(deviceId);
-    if (!device || !verifyRequest(device.public_key, req.method ?? 'GET', path, ts, raw, sig)) throw new ApiError(401, '签名无效');
+    // 设备被吊销、成员被移出以后走到这里：说清楚，不然只看到“签名无效”，不知道要重新加入
+    if (!device) throw new ApiError(401, `${DEVICE_UNKNOWN}：找管理员要一个邀请码，重新运行接入命令`);
+    if (!verifyRequest(device.public_key, req.method ?? 'GET', path, ts, raw, sig)) throw new ApiError(401, '签名无效');
     const now = store.clock();
     for (const [k, exp] of seen) if (exp < now) seen.delete(k);
     if (seen.has(sig)) throw new ApiError(401, '重复的请求');

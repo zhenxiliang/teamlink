@@ -5,8 +5,8 @@ import { hostname } from 'node:os';
 import { parseArgs } from 'node:util';
 import { generateDeviceKeys } from '../shared/crypto.ts';
 import type { Claim, InboxResponse, JoinResponse, RepoInfo, Tool, WhoamiResponse } from '../shared/protocol.ts';
-import { CHANGE_TYPES, memberNameError } from '../shared/protocol.ts';
-import { call, message, NetworkError } from './client.ts';
+import { CHANGE_TYPES, DEVICE_UNKNOWN, memberNameError } from '../shared/protocol.ts';
+import { call, ClientError, message, NetworkError } from './client.ts';
 import { git, identityFor, loadIdentities, readRepoConfig, REPO_CONFIG, repoRoot, saveIdentity, writeRepoConfig, type Identity, type RepoConfig } from './config.ts';
 import { runHook, type HookEvent } from './hook.ts';
 import { ensureLauncher, installClaude, installCodex, installedTools, type Installed } from './install.ts';
@@ -145,6 +145,16 @@ async function joinServer(server: string, opts: { invite: string; name: string; 
   saveIdentity(identity);
   out(`已以 ${opts.name} 的身份加入 ${server}。私钥只保存在本机。`);
   return identity;
+}
+
+/** 服务器已经不认这台设备了；连不上、别的错误（比如本机时间不对导致的 401）都不算。 */
+async function revoked(server: string, identity: Identity): Promise<boolean> {
+  try {
+    await call<WhoamiResponse>(server, identity, 'GET', '/api/v2/whoami');
+    return false;
+  } catch (e) {
+    return e instanceof ClientError && e.status === 401 && e.message.startsWith(DEVICE_UNKNOWN);
+  }
 }
 
 /** 在仓库根目录写 .teamlink.json；没指定仓库 ID 时按 origin 地址匹配服务器上登记的仓库。 */
@@ -286,6 +296,10 @@ export async function runCli(argv: string[], cwd = process.cwd(), print: (s: str
           return 0;
         }
         identity = await joinServer(server, { invite: values.invite, name: values.name, device: values.device }, out);
+      } else if (values.invite && values.name && (await revoked(server, identity))) {
+        // 这台设备被吊销了（或者成员被移出了），又带着新的邀请码：重新加入，换一把新密钥
+        out(`本机原来在 ${server} 的身份（${identity.name}）已经失效，用这个邀请码重新加入。`);
+        identity = await joinServer(server, { invite: values.invite, name: values.name, device: values.device }, out);
       } else {
         out(`本机已经以 ${identity.name} 的身份加入过 ${server}。`);
       }
@@ -303,6 +317,8 @@ export async function runCli(argv: string[], cwd = process.cwd(), print: (s: str
       if (codexHooks) out(installed('Codex', codexHooks));
       if (claude) out(installed('Claude Code', installClaude(root)));
       const who = await call<WhoamiResponse>(server, identity, 'GET', '/api/v2/whoami');
+      // 管理员给改过名：本机记的名字跟着改（notify 用它去掉点名里的自己）
+      if (who.member.name !== identity.name) saveIdentity({ ...identity, name: who.member.name });
       out(`服务器连接正常，身份 ${who.member.name}。`);
       if (git(root, ['status', '--porcelain', '--', REPO_CONFIG, 'AGENTS.md', 'CLAUDE.md'])) {
         out(`\n${REPO_CONFIG} 和 AGENTS.md 有改动，请提交一次（全队只需要一个人提交）。`);

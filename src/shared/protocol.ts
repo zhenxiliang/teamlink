@@ -32,6 +32,8 @@ export interface Claim {
 
 /** 说明最多这么多字（按字符算，不是字节）。 */
 export const MAX_SUMMARY_CHARS = 500;
+/** 服务器不认这台设备时（被吊销、成员被移出）401 的错误文字的开头：带着新邀请码重跑接入命令时，连接器据此重新加入。 */
+export const DEVICE_UNKNOWN = '这台设备没有登记，或者已经被管理员吊销';
 export const MAX_CLAIMS = 20;
 /** 一次注入（含边界标签、开头说明、队友段和“另有 N 条”那一行）最多这么多字节（UTF-8）。 */
 export const INJECTION_BUDGET_BYTES = 8000;

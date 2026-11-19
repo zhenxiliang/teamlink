@@ -18,9 +18,9 @@ import type {
   Tool,
 } from '../shared/protocol.ts';
 import { claimError, INJECTION_BUDGET_BYTES, MAX_ACKS, MAX_CLAIMS, MAX_SUMMARY_CHARS, memberNameError, VIAS } from '../shared/protocol.ts';
-import { normalizeText, renderBatch, type RenderItem } from '../shared/render.ts';
+import { excerpt, normalizeText, renderBatch, type RenderItem } from '../shared/render.ts';
 import { DEFAULT_POLICY, type Policy } from '../shared/rules.ts';
-import { newId, type MemberRow, type Notice, type QueuedNotice, type RepoRow, type Store } from './db.ts';
+import { newId, SYSTEM_SENDER, type DeviceInfo, type MemberRow, type Notice, type QueuedNotice, type RepoRow, type Store, type UndeliveredRow } from './db.ts';
 import { loadPolicy } from './policy.ts';
 import { rejectionMessage, reviewMessage } from './review.ts';
 
@@ -30,6 +30,10 @@ const TEAMMATE_WINDOW_MS = 7 * DAY;
 const MAX_TEAMMATES = 8;
 /** inbox --all 看最近 7 天。 */
 const INBOX_WINDOW_MS = 7 * DAY;
+/** 告诉发送人“这些没送到、已经删了”时，一条系统消息里最多列几条、每条摘录几个字。 */
+const TOLD_MAX = 5;
+const TOLD_EXCERPT_CHARS = 40;
+const TYPE_LABEL: Record<NoticeType, string> = { message: '消息', question: '提问', answer: '回答' };
 /** ask --wait 当场取走的回答记在这个名下（不是哪一个会话）：这个成员的任何会话都把它当成“交给了自己”。 */
 const WAIT_SESSION = 'cli';
 /**
@@ -102,7 +106,7 @@ export interface SendInput {
 const toItem = (n: QueuedNotice): RenderItem => ({
   id: n.id,
   type: n.type,
-  sender: n.sender_name ?? '未知成员',
+  sender: n.sender_member_id === SYSTEM_SENDER ? 'teamlink 服务器' : (n.sender_name ?? '已移出团队的成员'),
   summary: n.summary,
   claims: n.claims,
   replyTo: n.reply_to ? { id: n.reply_to, question: n.question ?? '' } : null,
@@ -159,16 +163,121 @@ export class Engine {
     } catch {
       throw new ApiError(400, 'publicKey 必须是 PEM 格式的 ed25519 公钥');
     }
+    const invalid = () => new ApiError(403, '邀请码无效、已用过或已过期');
+    let added = false;
     const res = this.store.transaction(() => {
-      if (this.store.memberByName(input.name)) throw new ApiError(409, `成员名 ${input.name} 已被占用`);
-      const member = this.store.addMember(input.name);
-      // 在事务里：邀请码不对时，上面加的成员一起回滚
-      if (!this.store.useInvite(input.invite, member.id)) throw new ApiError(403, '邀请码无效或已用过');
+      // 给现有成员再加一台设备的邀请码（teamlink-server invite --for）：名字要和那个成员一致
+      const owner = this.store.invite(input.invite)?.member_id;
+      let member = owner ? this.store.member(owner) : undefined;
+      if (owner) {
+        // 先用掉再比名字：码不能用时不透露它是给谁的；名字不对时抛错，用掉的这一步一起回滚
+        if (!member || !this.store.useInvite(input.invite, member.id)) throw invalid();
+        if (member.name !== input.name) throw new ApiError(403, `这个邀请码是给 ${member.name} 加设备用的，--name 要写 ${member.name}`);
+        added = true;
+      } else {
+        if (this.store.memberByName(input.name)) {
+          throw new ApiError(409, `成员名 ${input.name} 已被占用（要给这个成员再加一台设备，请管理员运行 teamlink-server invite --for ${input.name}）`);
+        }
+        member = this.store.addMember(input.name);
+        // 在事务里：邀请码不对时，上面加的成员一起回滚
+        if (!this.store.useInvite(input.invite, member.id)) throw invalid();
+      }
       const device = this.store.addDevice(member.id, input.publicKey, input.deviceName);
       return { memberId: member.id, deviceId: device.id, repos: this.store.repos().map(({ id, url }) => ({ id, url })) };
     });
-    this.event('member_joined', { member: res.memberId, name: input.name });
+    this.event(added ? 'device_added' : 'member_joined', { member: res.memberId, name: input.name, device: res.deviceId });
     return res;
+  }
+
+  // —— 成员和设备管理（只有服务器上的管理命令能调，接口里没有）——
+
+  /** 按名字找成员；找不到时报出现有的名字。 */
+  memberNamed(name: string): MemberRow {
+    const member = this.store.memberByName(name.trim());
+    if (!member) throw new Error(`找不到成员：${name}。现有成员：${this.store.members().map((m) => m.name).join('、') || '（无）'}`);
+    return member;
+  }
+
+  /** 改名：消息、会话都按成员 ID 记，不受影响；队友下一次 hook 拿到新的名单。 */
+  renameMember(name: string, to: string): MemberRow {
+    const member = this.memberNamed(name);
+    const why = memberNameError(to);
+    if (why) throw new Error(why);
+    if (to === member.name) return member;
+    if (this.store.memberByName(to)) throw new Error(`成员名 ${to} 已被占用`);
+    this.store.renameMember(member.id, to);
+    this.event('member_renamed', { member: member.id, from: member.name, to });
+    return { ...member, name: to };
+  }
+
+  /**
+   * 移出成员：他的设备全部失效，名字空出来。别人发给他、还没送到的，先告诉发送人；他发出去、还没送到的不再送。
+   * 返回吊销了几台设备、告诉了几个发送人。
+   */
+  removeMember(name: string): { member: MemberRow; devices: number; told: number } {
+    const member = this.memberNamed(name);
+    const res = this.store.transaction(() => {
+      const told = this.tellSenders(this.store.undelivered('r.member_id = ?', member.id), `${member.name} 已经被移出团队`);
+      const devices = this.store.devices().filter((d) => d.member_id === member.id).length;
+      this.store.removeMember(member.id);
+      return { devices, told };
+    });
+    this.event('member_removed', { member: member.id, name: member.name, ...res });
+    return { member, ...res };
+  }
+
+  /** 吊销一台设备（电脑丢了、私钥泄露）：成员还在，别的设备照常用。 */
+  revokeDevice(deviceId: string): { device: DeviceInfo; member: MemberRow | undefined; left: number } {
+    const all = this.store.devices();
+    const device = all.find((d) => d.id === deviceId.trim());
+    if (!device) throw new Error(`找不到设备：${deviceId}。用 teamlink-server members 查看设备 ID`);
+    this.store.removeDevice(device.id);
+    const member = this.store.member(device.member_id);
+    this.event('device_revoked', { device: device.id, member: device.member_id, name: member?.name });
+    return { device, member, left: all.filter((d) => d.member_id === device.member_id).length - 1 };
+  }
+
+  /**
+   * 没送到就要删掉的消息：给每个发送人在对应的仓库里留一条系统消息，说清是哪几条（调用方放在删除的同一个事务里）。
+   * 一个发送人一个仓库只留一条，最多列 TOLD_MAX 条。返回留了几条系统消息。
+   */
+  private tellSenders(rows: UndeliveredRow[], why: string): number {
+    // 发送人 + 仓库 → 通知 ID → 那条通知和没收到的人
+    const groups = new Map<string, Map<string, { row: UndeliveredRow; to: string[] }>>();
+    for (const row of rows) {
+      const key = `${row.sender_member_id}\n${row.repo_id}`;
+      const notices = groups.get(key) ?? new Map<string, { row: UndeliveredRow; to: string[] }>();
+      groups.set(key, notices);
+      const cur = notices.get(row.id) ?? { row, to: [] };
+      notices.set(row.id, cur);
+      cur.to.push(row.recipient);
+    }
+    for (const notices of groups.values()) {
+      const list = [...notices.values()];
+      const { sender_member_id, repo_id } = list[0].row;
+      const sender = this.store.member(sender_member_id);
+      if (!sender) continue;
+      const lines = list.slice(0, TOLD_MAX).map(({ row, to }) => `- ${row.created_at.slice(0, 10)} 发给 ${to.join('、')} 的${TYPE_LABEL[row.type]}：${excerpt(row.summary, TOLD_EXCERPT_CHARS)}`);
+      if (list.length > TOLD_MAX) lines.push(`另有 ${list.length - TOLD_MAX} 条。`);
+      this.store.insertNotice(
+        {
+          id: newId('n'),
+          repo_id,
+          sender_member_id: SYSTEM_SENDER,
+          sender_session_id: null,
+          type: 'message',
+          summary: `你发的 ${list.length} 条消息对方一直没有收到，已经删除（${why}）。还需要的话换个方式告诉对方：\n${lines.join('\n')}`,
+          claims: [],
+          to_names: [sender.name],
+          reply_to: null,
+          client_id: null,
+          created_at: this.store.now(),
+          via: null,
+        },
+        [sender.id],
+      );
+    }
+    return groups.size;
   }
 
   // —— 送达 ——
@@ -469,14 +578,19 @@ export class Engine {
 
   // —— 清理 ——
 
-  /** 清掉 30 天没活动的会话、30 天前的通知（连同收件记录，同一个事务）。返回删掉的条数。 */
-  prune(): { sessions: number; notices: number } {
+  /**
+   * 清掉 30 天没活动的会话、30 天前的通知（连同收件记录，同一个事务）、过期没用的邀请码。返回删掉的条数。
+   * 要删的通知里还有人没收到的，先给发送人留一条系统消息（told：留了几条）：不然消息悄悄没了，发送人一直以为对方看到了。
+   */
+  prune(): { sessions: number; notices: number; told: number } {
     const cutoff = this.store.now(-this.config.retentionDays * DAY);
     return this.store.transaction(() => {
       const sessions = this.store.run('DELETE FROM sessions WHERE last_seen_at < ?', cutoff);
+      const told = this.tellSenders(this.store.undelivered('n.created_at < ?', cutoff), `超过 ${this.config.retentionDays} 天`);
       this.store.run('DELETE FROM recipients WHERE notice_id IN (SELECT id FROM notices WHERE created_at < ?)', cutoff);
       const notices = this.store.run('DELETE FROM notices WHERE created_at < ?', cutoff);
-      return { sessions, notices };
+      this.store.run('DELETE FROM invites WHERE used_by IS NULL AND expires_at < ?', this.store.now());
+      return { sessions, notices, told };
     });
   }
 }

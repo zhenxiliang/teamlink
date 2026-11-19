@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS members (
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY, member_id TEXT NOT NULL, public_key TEXT NOT NULL, name TEXT, created_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS invites (code TEXT PRIMARY KEY, created_at TEXT NOT NULL, used_by TEXT);
+CREATE TABLE IF NOT EXISTS invites (code TEXT PRIMARY KEY, created_at TEXT NOT NULL, used_by TEXT, expires_at TEXT, member_id TEXT);
 CREATE TABLE IF NOT EXISTS repos (id TEXT PRIMARY KEY, url TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY, member_id TEXT NOT NULL, repo_id TEXT NOT NULL, tool TEXT NOT NULL,
@@ -49,6 +49,10 @@ const OLD_TABLES = ['activity', 'alerts', 'audit', 'subscriptions', 'branch_head
 /** 旧库里只要有其中一张表，就是要迁移的旧结构。 */
 const OLD_MARKERS = ['members', 'repos', 'notices'];
 const DAY = 24 * 3600_000;
+/** 邀请码默认几天内有效。 */
+export const INVITE_DAYS = 7;
+/** 系统消息（比如“你发的消息过期没送到”）的发送人：不是成员，显示成“teamlink 服务器”。 */
+export const SYSTEM_SENDER = 'teamlink';
 
 export interface RepoRow {
   id: string;
@@ -63,6 +67,31 @@ export interface DeviceRow {
   id: string;
   member_id: string;
   public_key: string;
+}
+/** 管理命令列设备时用：带设备名和登记时间。 */
+export interface DeviceInfo {
+  id: string;
+  member_id: string;
+  name: string | null;
+  created_at: string;
+}
+export interface InviteRow {
+  code: string;
+  used_by: string | null;
+  /** 过期时间；这一版以前生成的没有。 */
+  expires_at: string | null;
+  /** 不为空：这个码是给这个成员再加一台设备用的，不是新成员加入用的。 */
+  member_id: string | null;
+}
+/** 没送到的一条（按收件人一行）：清理、移出成员前告诉发送人时用。 */
+export interface UndeliveredRow {
+  id: string;
+  repo_id: string;
+  sender_member_id: string;
+  type: NoticeType;
+  summary: string;
+  created_at: string;
+  recipient: string;
 }
 export interface SessionRow {
   /** 工具:会话号 */
@@ -157,6 +186,7 @@ export class Store {
       this.db.exec('PRAGMA busy_timeout = 3000');
       this.enableWal();
       this.migration = this.prepare();
+      this.addColumns();
     } catch (e) {
       this.db.close();
       throw e;
@@ -196,6 +226,24 @@ export class Store {
 
   private hasOldTables(): boolean {
     return this.all('SELECT name FROM sqlite_master WHERE type = ? AND name IN (?, ?, ?)', 'table', ...OLD_MARKERS).length > 0;
+  }
+
+  /**
+   * 后来加的可空列（邀请码的过期时间、给哪个成员加设备）：只加列，结构版本不变，上一版的服务器照样能打开这个库（降级不受影响）。
+   * 没有过期时间、还没用的邀请码（这一版以前生成的）从现在起算 INVITE_DAYS 天。
+   */
+  private addColumns(): void {
+    const missing = (['expires_at', 'member_id'] as const).filter((c) => !this.columns('invites').has(c));
+    const expires = this.now(INVITE_DAYS * DAY);
+    if (missing.length === 0) {
+      // 多数时候没有要补的：先只读地看一眼，不拿写锁
+      if (!this.get('SELECT 1 AS x FROM invites WHERE expires_at IS NULL AND used_by IS NULL LIMIT 1')) return;
+    }
+    this.transaction(() => {
+      const have = this.columns('invites');
+      for (const c of missing) if (!have.has(c)) this.db.exec(`ALTER TABLE invites ADD COLUMN ${c} TEXT`);
+      this.run('UPDATE invites SET expires_at = ? WHERE expires_at IS NULL AND used_by IS NULL', expires);
+    });
   }
 
   /** 先迁移、再建表。返回迁移结果；新库或已经是新结构时返回 null。 */
@@ -446,14 +494,24 @@ export class Store {
 
   // —— 邀请码、成员、设备 ——
 
-  createInvite(): string {
+  /** 生成邀请码，days 天内有效。给了 memberId：这个码只能用来给这个成员再加一台设备。 */
+  createInvite(opts: { days?: number; memberId?: string } = {}): string {
     const code = randomBytes(6).toString('hex');
-    this.run('INSERT INTO invites (code, created_at) VALUES (?, ?)', code, this.now());
+    this.run(
+      'INSERT INTO invites (code, created_at, expires_at, member_id) VALUES (?, ?, ?, ?)',
+      code,
+      this.now(),
+      this.now((opts.days ?? INVITE_DAYS) * DAY),
+      opts.memberId ?? null,
+    );
     return code;
   }
-  /** 用掉一个邀请码；没有这个码或者已经用过时返回 false。 */
+  invite(code: string): InviteRow | undefined {
+    return this.get<InviteRow>('SELECT code, used_by, expires_at, member_id FROM invites WHERE code = ?', code);
+  }
+  /** 用掉一个邀请码；没有这个码、已经用过或者过期了时返回 false。 */
   useInvite(code: string, memberId: string): boolean {
-    return this.run('UPDATE invites SET used_by = ? WHERE code = ? AND used_by IS NULL', memberId, code) === 1;
+    return this.run('UPDATE invites SET used_by = ? WHERE code = ? AND used_by IS NULL AND (expires_at IS NULL OR expires_at > ?)', memberId, code, this.now()) === 1;
   }
 
   addMember(name: string): MemberRow {
@@ -478,6 +536,29 @@ export class Store {
   }
   device(id: string): DeviceRow | undefined {
     return this.get<DeviceRow>('SELECT id, member_id, public_key FROM devices WHERE id = ?', id);
+  }
+  /** 全部设备，按登记时间。 */
+  devices(): DeviceInfo[] {
+    return this.all<DeviceInfo>('SELECT id, member_id, name, created_at FROM devices ORDER BY created_at, rowid');
+  }
+  /** 吊销设备：删掉它的公钥，这台设备的请求从此验不过签名。返回删了几台（0 或 1）。 */
+  removeDevice(id: string): number {
+    return this.run('DELETE FROM devices WHERE id = ?', id);
+  }
+  renameMember(id: string, name: string): void {
+    this.run('UPDATE members SET name = ? WHERE id = ?', name, id);
+  }
+  /**
+   * 移出成员（调用方放进事务）：设备、会话、收件记录、给他加设备的邀请码一起删；他发出去还没送到的不再送。
+   * 他发过的通知本身留到过期清理：别人对他提问的回答、已经送到的消息还指向它们。
+   */
+  removeMember(id: string): void {
+    this.run('DELETE FROM recipients WHERE member_id = ?', id);
+    this.run('DELETE FROM recipients WHERE acked_at IS NULL AND notice_id IN (SELECT id FROM notices WHERE sender_member_id = ?)', id);
+    this.run('DELETE FROM devices WHERE member_id = ?', id);
+    this.run('DELETE FROM sessions WHERE member_id = ?', id);
+    this.run('DELETE FROM invites WHERE member_id = ? AND used_by IS NULL', id);
+    this.run('DELETE FROM members WHERE id = ?', id);
   }
 
   // —— 会话 ——
@@ -609,6 +690,20 @@ export class Store {
   /** 连接器确认这条已经输出给 AI 了。只认交出去过的；返回这次确认了几条（0 或 1）。 */
   ack(noticeId: string, memberId: string): number {
     return this.run('UPDATE recipients SET acked_at = ? WHERE notice_id = ? AND member_id = ? AND delivered_at IS NOT NULL AND acked_at IS NULL', this.now(), noticeId, memberId);
+  }
+
+  /**
+   * 还没确认送到的收件记录（where 是对 n、r 的条件），带收件人的名字，按创建时间。
+   * 只看发送人还在的：系统消息、已经移出的成员发的，没有人可以告诉。
+   */
+  undelivered(where: string, ...params: unknown[]): UndeliveredRow[] {
+    return this.all<UndeliveredRow>(
+      `SELECT n.id, n.repo_id, n.sender_member_id, n.type, n.summary, n.created_at, m.name AS recipient
+       FROM recipients r JOIN notices n ON n.id = r.notice_id JOIN members m ON m.id = r.member_id
+       WHERE r.acked_at IS NULL AND n.sender_member_id IN (SELECT id FROM members) AND ${where}
+       ORDER BY n.created_at, n.rowid, r.rowid`,
+      ...params,
+    );
   }
 
   /** 发送限流用：某个会话（没有会话时按成员）sinceIso 之后发了几条。 */

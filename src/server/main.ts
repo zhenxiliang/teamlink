@@ -1,4 +1,4 @@
-// 服务器入口：`teamlink-server init | add-repo | invite | policy | start`。
+// 服务器入口：`teamlink-server init | add-repo | invite | members | rename-member | remove-member | revoke-device | policy | start`。
 
 import { X509Certificate } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
@@ -10,7 +10,7 @@ import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { PROTOCOL } from '../shared/protocol.ts';
 import { createApi, type TlsMaterial } from './api.ts';
-import { Store } from './db.ts';
+import { INVITE_DAYS, Store } from './db.ts';
 import { DEFAULT_CONFIG, Engine, type EngineConfig } from './engine.ts';
 import { loadPolicy, savePolicy } from './policy.ts';
 
@@ -168,7 +168,14 @@ function lanAddresses(): string[] {
 const USAGE = `用法：
   teamlink-server init --repo <git 地址> [--data 目录]       登记仓库，打印仓库 ID 和第一个邀请码
   teamlink-server add-repo --repo <git 地址> [--data 目录]   再登记一个仓库（只登记，不 clone）
-  teamlink-server invite [--count 5] [--data 目录]          生成邀请码（每人一个，用过就失效）
+  teamlink-server invite [--count 5] [--days 7] [--for 成员名] [--data 目录]
+                                                           生成邀请码（每人一个，用过就失效，默认 7 天内有效）；
+                                                           --for：给已有成员再加一台设备用（新电脑、设备被吊销以后）
+  teamlink-server members [--data 目录]                     列出成员、每人的设备和最近活动时间
+  teamlink-server rename-member --name 旧名字 --to 新名字 [--data 目录]
+  teamlink-server remove-member --name 名字 [--data 目录]   移出成员：他的设备全部失效，名字空出来
+  teamlink-server revoke-device --device 设备ID [--data 目录]
+                                                           吊销一台设备（电脑丢了、私钥泄露），成员还在
   teamlink-server policy [--allow-domain 域名] [--remove-domain 域名] [--data 目录]
                                                            查看或修改消息里允许出现的链接域名；不带参数时打印当前名单
   teamlink-server start [--port 7420] [--host 127.0.0.1] [--data 目录] [--cert 证书.pem --key 私钥.pem]
@@ -205,6 +212,11 @@ export async function runServerCli(argv: string[]): Promise<void> {
         cert: { type: 'string' },
         key: { type: 'string' },
         count: { type: 'string', default: '1' },
+        days: { type: 'string', default: String(INVITE_DAYS) },
+        for: { type: 'string' },
+        name: { type: 'string' },
+        to: { type: 'string' },
+        device: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
       },
     });
@@ -218,7 +230,7 @@ export async function runServerCli(argv: string[]): Promise<void> {
     console.log(USAGE);
     return;
   }
-  if (!['init', 'add-repo', 'invite', 'policy', 'start'].includes(cmd)) {
+  if (!['init', 'add-repo', 'invite', 'members', 'rename-member', 'remove-member', 'revoke-device', 'policy', 'start'].includes(cmd)) {
     console.log(USAGE);
     process.exitCode = 1;
     return;
@@ -236,13 +248,58 @@ export async function runServerCli(argv: string[]): Promise<void> {
       const repo = engine.addRepo(url);
       console.log(existed ? `仓库已经登记过：${repo.url}` : `已登记仓库 ${repo.url}`);
       console.log(`  仓库 ID：${repo.id}`);
-      if (cmd === 'init') console.log(`  邀请码：${engine.store.createInvite()}`);
+      if (cmd === 'init') {
+        console.log(`  邀请码：${engine.store.createInvite()}`);
+        console.error(`邀请码 ${INVITE_DAYS} 天内有效，只能用一次。`);
+      }
       break;
     }
     case 'invite': {
       const count = Number(values.count);
       if (!Number.isInteger(count) || count < 1 || count > 1000) throw new Error('--count 要是 1 到 1000 之间的整数');
-      for (let i = 0; i < count; i++) console.log(engine.store.createInvite());
+      const days = Number(values.days);
+      if (!Number.isInteger(days) || days < 1 || days > 365) throw new Error('--days 要是 1 到 365 之间的整数');
+      const member = values.for === undefined ? undefined : engine.memberNamed(values.for);
+      for (let i = 0; i < count; i++) console.log(engine.store.createInvite({ days, memberId: member?.id }));
+      // 说明打到 stderr：标准输出只有邀请码，脚本里可以直接接着用
+      console.error(`${days} 天内有效，每个只能用一次。${member ? `只能用来给 ${member.name} 加设备：在那台电脑上运行接入命令，--name 写 ${member.name}。` : ''}`);
+      break;
+    }
+    case 'members': {
+      const members = engine.store.members();
+      if (members.length === 0) console.log('还没有成员。');
+      const devices = engine.store.devices();
+      const day = (iso: string | null | undefined) => iso?.slice(0, 10) ?? '';
+      for (const m of members) {
+        const seen = engine.store.get<{ last: string | null }>('SELECT MAX(last_seen_at) AS last FROM sessions WHERE member_id = ?', m.id)?.last;
+        console.log(`${m.name}（${m.id}）  最近活动：${day(seen) || '30 天内没有'}`);
+        const own = devices.filter((d) => d.member_id === m.id);
+        for (const d of own) console.log(`  设备 ${d.id}  ${d.name ?? '（没有名字）'}  ${day(d.created_at)} 登记`);
+        if (own.length === 0) console.log(`  没有设备：teamlink-server invite --for ${m.name} 生成给他加设备的邀请码`);
+      }
+      break;
+    }
+    case 'rename-member': {
+      const name = values.name ?? positionals[1];
+      if (!name || !values.to) throw new Error('用法：teamlink-server rename-member --name 旧名字 --to 新名字');
+      const m = engine.renameMember(name, values.to);
+      console.log(`已把 ${name.trim()} 改名为 ${m.name}。队友下一次用 AI 工具时拿到新名单；他本人重跑一次 teamlink setup 更新本机记的名字。`);
+      break;
+    }
+    case 'remove-member': {
+      const name = values.name ?? positionals[1];
+      if (!name) throw new Error('用法：teamlink-server remove-member --name 名字');
+      const r = engine.removeMember(name);
+      console.log(`已移出 ${r.member.name}，吊销了他的 ${r.devices} 台设备。${r.told > 0 ? '发给他、还没送到的消息已经删除，并告诉了发送人。' : ''}`);
+      break;
+    }
+    case 'revoke-device': {
+      const id = values.device ?? positionals[1];
+      if (!id) throw new Error('用法：teamlink-server revoke-device --device 设备ID（用 teamlink-server members 查看）');
+      const r = engine.revokeDevice(id);
+      const owner = r.member?.name ?? '已移出的成员';
+      console.log(`已吊销 ${owner} 的设备 ${r.device.id}${r.device.name ? `（${r.device.name}）` : ''}，这台设备的请求从现在起被拒绝。`);
+      if (r.member) console.log(r.left > 0 ? `${owner} 还有 ${r.left} 台设备可用。` : `${owner} 没有可用的设备了：teamlink-server invite --for ${owner} 生成给他加设备的邀请码。`);
       break;
     }
     case 'policy': {
