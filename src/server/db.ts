@@ -4,7 +4,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { existsSync, rmSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import type { Claim, NoticeType, NoticeVia, Tool } from '../shared/protocol.ts';
 import { claimError, MAX_CLAIMS, MAX_SUMMARY_CHARS } from '../shared/protocol.ts';
 
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS notices (
 );
 CREATE INDEX IF NOT EXISTS notices_session ON notices(sender_session_id, created_at);
 CREATE INDEX IF NOT EXISTS notices_created ON notices(created_at);
+CREATE INDEX IF NOT EXISTS notices_sender ON notices(sender_member_id, created_at);
 CREATE TABLE IF NOT EXISTS recipients (
   notice_id TEXT NOT NULL, member_id TEXT NOT NULL, delivered_at TEXT, delivered_session TEXT,
   acked_at TEXT, attempts INTEGER NOT NULL DEFAULT 0,
@@ -467,15 +468,29 @@ export class Store {
     return new Date(this.clock() + offsetMs).toISOString();
   }
 
+  /**
+   * 编译好的语句按 SQL 文本留着重复用：每个请求要跑十来句，句句重新编译不划算。
+   * SQL 文本都是代码里写死的（参数走占位符），种类有限，不会越攒越多；表结构变了 SQLite 自己会重新编译。
+   */
+  private readonly statements = new Map<string, StatementSync>();
+  private statement(sql: string): StatementSync {
+    let s = this.statements.get(sql);
+    if (!s) {
+      s = this.db.prepare(sql);
+      this.statements.set(sql, s);
+    }
+    return s;
+  }
+
   all<T = Row>(sql: string, ...params: unknown[]): T[] {
-    return this.db.prepare(sql).all(...(params as never[])) as T[];
+    return this.statement(sql).all(...(params as never[])) as T[];
   }
   get<T = Row>(sql: string, ...params: unknown[]): T | undefined {
-    return this.db.prepare(sql).get(...(params as never[])) as T | undefined;
+    return this.statement(sql).get(...(params as never[])) as T | undefined;
   }
   /** 返回改动的行数。 */
   run(sql: string, ...params: unknown[]): number {
-    return Number(this.db.prepare(sql).run(...(params as never[])).changes);
+    return Number(this.statement(sql).run(...(params as never[])).changes);
   }
 
   // —— 仓库 ——
