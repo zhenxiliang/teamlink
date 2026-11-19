@@ -41,11 +41,14 @@ if [ "$(remote '~/teamlink/node/bin/node -v 2>/dev/null || true')" != "$NODE_VER
     echo "   服务器下载失败，改为从这台电脑下载后上传"
     CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/teamlink
     mkdir -p "$CACHE"
-    # 先下载到临时文件：下载到一半断了，不会留下一份不完整的缓存。临时文件名带进程号：两次部署同时下载时各写各的
+    # 先下载到临时文件：下载到一半断了，不会留下一份不完整的缓存。临时文件名带进程号：两次部署同时下载时各写各的。
+    # 下载失败、中途按 Ctrl-C 时，退出前把临时文件删掉，不会越攒越多
     if [ ! -f "$CACHE/$TARBALL" ]; then
       PART="$CACHE/$TARBALL.$$.part"
-      curl -fL -o "$PART" "$URL" || { rm -f "$PART"; exit 1; }
+      trap 'rm -f "$PART"' EXIT
+      curl -fL -o "$PART" "$URL"
       mv "$PART" "$CACHE/$TARBALL"
+      trap - EXIT
     fi
     # 上传前先在本机校验：缓存坏了就删掉，下次重新下载，不会每次都上传同一份坏文件
     GOT=$( (shasum -a 256 "$CACHE/$TARBALL" 2>/dev/null || sha256sum "$CACHE/$TARBALL") | awk '{ print $1 }')
