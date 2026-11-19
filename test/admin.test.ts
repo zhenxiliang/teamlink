@@ -244,3 +244,44 @@ test('过期清理：要删的消息里还有人没收到的，先给发送人�
     store.clock = real;
   }
 });
+
+test('吊销设备：交给那台设备、还没确认的消息，同一个成员的另一台设备马上能收到，不用等旧会话下线', async () => {
+  const laptop = join_('kate');
+  const desktop = join_('kate', engine.store.createInvite({ memberId: laptop.memberId }));
+  const leo = join_('leo');
+  const start = (d: Device, session: string) => api(d, 'POST', '/api/v2/sessions/start', { repoId, tool: 'claude', sessionId: session, acks: [] });
+  const sent = await send(leo, 'kate', '交给笔记本、没确认');
+  assert.equal(sent.status, 200);
+  // 笔记本的会话拿走了，但没回确认（电脑丢了）
+  assert.deepEqual((await start(laptop, 'kate-laptop')).data.ids, [sent.data.id]);
+  assert.deepEqual((await start(desktop, 'kate-desktop')).data.ids, [], '笔记本的会话还在线：先不重复给');
+
+  engine.revokeDevice(laptop.deviceId);
+  assert.deepEqual((await api(desktop, 'POST', '/api/v2/activity', { repoId, tool: 'claude', sessionId: 'kate-desktop', acks: [] })).data.ids, [sent.data.id]);
+  // 台式机自己的会话照常算在线
+  const again = await send(leo, 'kate', '吊销以后发的');
+  assert.deepEqual((again.data.presence as { online: boolean }[]).map((p) => p.online), [true]);
+});
+
+test('系统消息冒充不了：成员名里不能有 teamlink；没送到的人很多时，系统消息也不超过注入预算', async () => {
+  for (const name of ['teamlink 服务器', 'TeamLink', '我是teamlink']) {
+    assert.throws(() => join_(name), /成员名里不能有 teamlink/, name);
+  }
+  assert.match(admin('rename-member', '--name', 'leo', '--to', 'teamlink 服务器').err, /成员名里不能有 teamlink/);
+
+  const mia = join_('mia');
+  const many = Array.from({ length: 30 }, (_, i) => `很长很长很长很长很长很长很长很长很长的名字${String(i).padStart(2, '0')}`);
+  for (const name of many) join_(name);
+  for (let i = 0; i < 5; i++) assert.equal((await api(mia, 'POST', '/api/v2/notices', { repoId, to: many, summary: `群发第 ${i} 条` })).status, 200);
+  const store = engine.store;
+  const real = store.clock;
+  try {
+    store.clock = () => real() + 31 * DAY;
+    engine.prune();
+    const r = engine.deliver({ id: mia.memberId, name: 'mia' }, { repoId, tool: 'claude', sessionId: 'mia-1', acks: [], kind: 'activity' });
+    assert.match(r.text, /发给 很长很长很长很长很长很长很长很长很长的名字00、很长很长很长很长很长很长很长很长很长的名字01、很长很长很长很长很长很长很长很长很长的名字02 等 30 人 的消息：群发第 0 条/);
+    assert.ok(Buffer.byteLength(r.text) <= engine.config.budgetBytes, `注入 ${Buffer.byteLength(r.text)} 字节`);
+  } finally {
+    store.clock = real;
+  }
+});

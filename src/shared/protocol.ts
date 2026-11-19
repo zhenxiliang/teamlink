@@ -59,6 +59,8 @@ export function memberNameError(name: unknown): string | null {
   if (/[<>]/.test(name)) return '成员名不能有尖括号';
   // AI 发的消息显示出来会和本人亲手写的一样
   if (name.includes(PERSON_MARK)) return `成员名里不能有${PERSON_MARK}`;
+  // 服务器自己发的系统消息显示成“来自 teamlink 服务器”：成员叫这个名字，发的消息就和系统消息分不出来
+  if (/teamlink/i.test(name)) return '成员名里不能有 teamlink（留给服务器发的系统消息）';
   if ([...name].length > MAX_NAME_CHARS) return `成员名最长 ${MAX_NAME_CHARS} 个字`;
   return null;
 }

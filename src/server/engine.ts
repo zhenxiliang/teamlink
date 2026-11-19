@@ -30,8 +30,9 @@ const TEAMMATE_WINDOW_MS = 7 * DAY;
 const MAX_TEAMMATES = 8;
 /** inbox --all 看最近 7 天。 */
 const INBOX_WINDOW_MS = 7 * DAY;
-/** 告诉发送人“这些没送到、已经删了”时，一条系统消息里最多列几条、每条摘录几个字。 */
+/** 告诉发送人“这些没送到、已经删了”时，一条系统消息里最多列几条、每条列几个收件人、摘录几个字。 */
 const TOLD_MAX = 5;
+const TOLD_NAMES = 3;
 const TOLD_EXCERPT_CHARS = 40;
 const TYPE_LABEL: Record<NoticeType, string> = { message: '消息', question: '提问', answer: '回答' };
 /** ask --wait 当场取走的回答记在这个名下（不是哪一个会话）：这个成员的任何会话都把它当成“交给了自己”。 */
@@ -226,12 +227,19 @@ export class Engine {
     return { member, ...res };
   }
 
-  /** 吊销一台设备（电脑丢了、私钥泄露）：成员还在，别的设备照常用。 */
+  /**
+   * 吊销一台设备（电脑丢了、私钥泄露）：成员还在，别的设备照常用。
+   * 这个成员的会话一起记成结束：会话不记是哪台设备开的，而交给被吊销设备的会话、还没确认的消息，要等那个会话下线（30 分钟）
+   * 才会改交给别的会话。别的设备上还开着的会话，下一次 hook 就重新算在线。
+   */
   revokeDevice(deviceId: string): { device: DeviceInfo; member: MemberRow | undefined; left: number } {
     const all = this.store.devices();
     const device = all.find((d) => d.id === deviceId.trim());
     if (!device) throw new Error(`找不到设备：${deviceId}。用 teamlink-server members 查看设备 ID`);
-    this.store.removeDevice(device.id);
+    this.store.transaction(() => {
+      this.store.removeDevice(device.id);
+      this.store.run('UPDATE sessions SET ended_at = ? WHERE member_id = ? AND ended_at IS NULL', this.store.now(), device.member_id);
+    });
     const member = this.store.member(device.member_id);
     this.event('device_revoked', { device: device.id, member: device.member_id, name: member?.name });
     return { device, member, left: all.filter((d) => d.member_id === device.member_id).length - 1 };
@@ -257,7 +265,9 @@ export class Engine {
       const { sender_member_id, repo_id } = list[0].row;
       const sender = this.store.member(sender_member_id);
       if (!sender) continue;
-      const lines = list.slice(0, TOLD_MAX).map(({ row, to }) => `- ${row.created_at.slice(0, 10)} 发给 ${to.join('、')} 的${TYPE_LABEL[row.type]}：${excerpt(row.summary, TOLD_EXCERPT_CHARS)}`);
+      // 收件人最多列 TOLD_NAMES 个：一条群发给几十个人时，这条系统消息也不会超过注入预算
+      const names = (to: string[]) => (to.length > TOLD_NAMES ? `${to.slice(0, TOLD_NAMES).join('、')} 等 ${to.length} 人` : to.join('、'));
+      const lines = list.slice(0, TOLD_MAX).map(({ row, to }) => `- ${row.created_at.slice(0, 10)} 发给 ${names(to)} 的${TYPE_LABEL[row.type]}：${excerpt(row.summary, TOLD_EXCERPT_CHARS)}`);
       if (list.length > TOLD_MAX) lines.push(`另有 ${list.length - TOLD_MAX} 条。`);
       this.store.insertNotice(
         {
