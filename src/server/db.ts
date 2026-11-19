@@ -206,13 +206,14 @@ export class Store {
    * 从第一次尝试起满 5 秒就不再试、把错误报出去（有的情况下一次尝试自己会等满 busy_timeout，所以按时间算，不按次数算）。
    */
   private enableWal(): void {
-    const deadline = Date.now() + 5000;
+    // 用不受系统改时间影响的时钟
+    const deadline = performance.now() + 5000;
     for (;;) {
       try {
         this.db.exec('PRAGMA journal_mode = WAL');
         return;
       } catch (e) {
-        if (Date.now() >= deadline || !(e instanceof Error) || !e.message.includes('database is locked')) throw e;
+        if (performance.now() >= deadline || !(e instanceof Error) || !e.message.includes('database is locked')) throw e;
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
       }
     }
