@@ -152,9 +152,10 @@ export class Store {
     this.path = path;
     this.log = opts.log ?? ((line) => process.stderr.write(`${line}\n`));
     this.db = new DatabaseSync(path);
-    // busy_timeout 要先设：别的进程（服务器、正在迁移的管理命令）拿着库的时候，journal_mode 这一句也要等，不能立即报“database is locked”
-    this.db.exec('PRAGMA busy_timeout = 3000; PRAGMA journal_mode = WAL;');
     try {
+      // busy_timeout 要先设：别的进程（服务器、正在迁移的管理命令）拿着库的时候，后面的语句要等，不能立即报“database is locked”
+      this.db.exec('PRAGMA busy_timeout = 3000');
+      this.enableWal();
       this.migration = this.prepare();
     } catch (e) {
       this.db.close();
@@ -165,6 +166,22 @@ export class Store {
       this.log(`teamlink：数据库已升级到结构版本 ${SCHEMA_VERSION}，搬过来 ${m.kept} 条通知（还有人没收到的，以及 7 天内的提问），丢掉 ${m.dropped} 条。原库备份在 ${m.backup}，降级回旧版时用它。`);
       if (m.duplicateRepos.length > 0) {
         this.log(`teamlink：这些仓库和更早登记的地址重复，没有搬过来：${m.duplicateRepos.join('、')}。关联到它们的成员要重新运行 teamlink link。`);
+      }
+    }
+  }
+
+  /**
+   * 切到 WAL。库还不是 WAL、又有别的进程同时打开时（几个管理命令一起跑），这一句要独占数据库，
+   * SQLite 不等 busy_timeout、直接报 database is locked：等一下再试，最多 5 秒。切成功以后库文件里就记着 WAL，以后不用再切。
+   */
+  private enableWal(): void {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        this.db.exec('PRAGMA journal_mode = WAL');
+        return;
+      } catch (e) {
+        if (attempt >= 50 || !(e instanceof Error) || !e.message.includes('database is locked')) throw e;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
       }
     }
   }
