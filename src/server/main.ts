@@ -110,6 +110,14 @@ export async function startServer(opts: { engine: Engine; port?: number; host?: 
   };
   const certTimer = setInterval(reload, CERT_RELOAD_MS);
   certTimer.unref();
+  // 停止时：进行中的请求答完就断开它的连接。不然连接按 keep-alive 留着，客户端还能在上面发新请求，drain 也一直等不完
+  let draining = false;
+  server.prependListener('request', (_req, res) => {
+    if (draining) res.setHeader('connection', 'close');
+    res.once('close', () => {
+      if (draining) server.closeIdleConnections();
+    });
+  });
   const addr = server.address() as AddressInfo;
   return {
     url: `${tls ? 'https' : 'http'}://${addr.address.includes(':') ? `[${addr.address}]` : addr.address}:${addr.port}`,
@@ -125,6 +133,7 @@ export async function startServer(opts: { engine: Engine; port?: number; host?: 
     drain: async () => {
       clearInterval(timer);
       clearInterval(certTimer);
+      draining = true;
       await new Promise<void>((ok) => {
         server.close(() => ok());
         server.closeIdleConnections();
