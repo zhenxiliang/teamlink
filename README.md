@@ -334,7 +334,7 @@ src/server/      服务器：HTTP 接口、存储和迁移、送达、审核、�
 src/connector/   本地连接器：命令行、hook、安装、发件箱、本地状态、status
 src/shared/      两边共用：协议、注入文字的渲染、设备签名、域名白名单
 deploy/          部署到 Linux 服务器的脚本
-test/            单元测试和端到端测试
+test/            单元测试（unit）、端到端测试（e2e-*，按主题分文件，公共部分在 helpers.ts）、管理命令（admin）、备份和日志（ops）
 docs/            升级说明
 ```
 
