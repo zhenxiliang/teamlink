@@ -41,7 +41,15 @@ if [ "$(remote '~/teamlink/node/bin/node -v 2>/dev/null || true')" != "$NODE_VER
     echo "   服务器下载失败，改为从这台电脑下载后上传"
     CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/teamlink
     mkdir -p "$CACHE"
-    [ -f "$CACHE/$TARBALL" ] || curl -fL -o "$CACHE/$TARBALL" "$URL"
+    # 先下载到临时文件：下载到一半断了，不会留下一份不完整的缓存
+    [ -f "$CACHE/$TARBALL" ] || { curl -fL -o "$CACHE/$TARBALL.part" "$URL" && mv "$CACHE/$TARBALL.part" "$CACHE/$TARBALL"; }
+    # 上传前先在本机校验：缓存坏了就删掉，下次重新下载，不会每次都上传同一份坏文件
+    GOT=$( (shasum -a 256 "$CACHE/$TARBALL" 2>/dev/null || sha256sum "$CACHE/$TARBALL") | awk '{ print $1 }')
+    if [ "$GOT" != "$WANT" ]; then
+      rm -f "$CACHE/$TARBALL"
+      echo "本机缓存的 Node.js 安装包 SHA256 校验不通过，已删除；请重新运行"
+      exit 1
+    fi
     remote "set -e; mkdir -p ~/teamlink; cat > ~/teamlink/node.tar.xz; $UNPACK" < "$CACHE/$TARBALL"
   fi
 fi
