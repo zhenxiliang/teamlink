@@ -172,15 +172,17 @@ export class Store {
 
   /**
    * 切到 WAL。库还不是 WAL、又有别的进程同时打开时（几个管理命令一起跑），这一句要独占数据库，
-   * SQLite 不等 busy_timeout、直接报 database is locked：等一下再试，最多 5 秒。切成功以后库文件里就记着 WAL，以后不用再切。
+   * SQLite 不等 busy_timeout、直接报 database is locked：等一下再试。切成功以后库文件里就记着 WAL，以后不用再切。
+   * 从第一次尝试起满 5 秒就不再试、把错误报出去（有的情况下一次尝试自己会等满 busy_timeout，所以按时间算，不按次数算）。
    */
   private enableWal(): void {
-    for (let attempt = 0; ; attempt++) {
+    const deadline = Date.now() + 5000;
+    for (;;) {
       try {
         this.db.exec('PRAGMA journal_mode = WAL');
         return;
       } catch (e) {
-        if (attempt >= 50 || !(e instanceof Error) || !e.message.includes('database is locked')) throw e;
+        if (Date.now() >= deadline || !(e instanceof Error) || !e.message.includes('database is locked')) throw e;
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
       }
     }
