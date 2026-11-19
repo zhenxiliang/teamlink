@@ -4,7 +4,7 @@ import { X509Certificate } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
 import type { ServerResponse } from 'node:http';
 import type { Server as TlsServer } from 'node:https';
-import type { AddressInfo } from 'node:net';
+import type { AddressInfo, Socket } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -116,14 +116,16 @@ export async function startServer(opts: { engine: Engine; port?: number; host?: 
   // Node 也当成空闲的直接断开，读得慢的客户端会收到半截响应。所以先等这样的响应写完
   let draining = false;
   let closeWhenFlushed: (() => void) | null = null;
-  const open = new Set<ServerResponse>();
+  /** 还没答完的响应 → 它所在的连接。 */
+  const open = new Map<ServerResponse, Socket>();
   server.prependListener('request', (req, res) => {
-    open.add(res);
+    open.set(res, req.socket);
     if (draining) res.setHeader('connection', 'close');
     res.once('close', () => {
       open.delete(res);
       if (!draining) return;
-      req.socket.end();
+      // 同一条连接上还有请求没答完（客户端连着发了几个）：等最后一个答完再断
+      if (![...open.values()].includes(req.socket)) req.socket.end();
       closeWhenFlushed?.();
     });
   });
@@ -145,7 +147,7 @@ export async function startServer(opts: { engine: Engine; port?: number; host?: 
       draining = true;
       await new Promise<void>((ok) => {
         closeWhenFlushed = () => {
-          if ([...open].some((res) => res.writableEnded && !res.writableFinished)) return;
+          if ([...open.keys()].some((res) => res.writableEnded && !res.writableFinished)) return;
           closeWhenFlushed = null;
           server.close(() => ok());
         };
