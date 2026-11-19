@@ -3107,3 +3107,23 @@ test('teamlink-server start：收到 SIGTERM 正常退出（退出码 0），日
   assert.equal(r.code, 0, r.out + r.err);
   assert.match(r.err, /stopping.*SIGTERM/);
 });
+
+test('服务器停止（drain）：进行中的请求照常答完，答完就断开连接，不在这条连接上接新请求', async () => {
+  const e = openEngine(mkdtempSync(join(tmp, 'server-drain-')), { log: () => {} });
+  const s = await startServer({ engine: e, port: 0 });
+  const sock = connect(Number(new URL(s.url).port), '127.0.0.1');
+  let got = '';
+  sock.on('data', (d) => (got += d));
+  const closed = new Promise<void>((ok) => sock.once('close', () => ok()));
+  await new Promise((ok) => sock.once('connect', ok));
+  // 请求发到一半时开始停止
+  sock.write(`POST /api/v2/join HTTP/1.1\r\nHost: x\r\n${PROTOCOL_HEADER}: ${PROTOCOL}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{`);
+  await sleep(50);
+  const drained = s.drain();
+  await sleep(50);
+  sock.write('}');
+  await Promise.all([closed, drained]);
+  assert.match(got, /^HTTP\/1\.1 400 /, '进行中的请求答完了');
+  assert.equal(got.match(/HTTP\/1\.1 /g)?.length, 1);
+  e.store.db.close();
+});
