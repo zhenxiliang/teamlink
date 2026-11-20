@@ -10,7 +10,7 @@ import { TOOLS } from '../shared/protocol.ts';
 import { call, ClientError, message, NetworkError } from './client.ts';
 import { git, identityFor, readRepoConfig, teamlinkHome, type Identity, type RepoConfig } from './config.ts';
 import { flushOutbox, renderNotes } from './outbox.ts';
-import { saveReceived } from './received.ts';
+import { saveItems, saveReceived } from './received.ts';
 import {
   backoffActive,
   clearAcks,
@@ -316,6 +316,7 @@ async function remember(ctx: Ctx, resp: DeliveryResponse | null): Promise<void> 
   }
   if (Array.isArray(resp.members)) safely(ctx, () => saveMembers(ctx.dir, ctx.cfg.server, resp.members as string[]));
   if (resp.hasMessages) safely(ctx, () => saveReceived(ctx.root, resp.messagesText ?? '', resp.ids?.length ?? 0));
+  if (Array.isArray(resp.items)) safely(ctx, () => saveItems(ctx.root, resp.items as unknown[]));
 }
 
 /** 收尾检查拦下时的结尾：按这批里有什么给出动作。 */

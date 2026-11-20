@@ -195,10 +195,13 @@ export function createApi(engine: Engine, tls?: TlsMaterial): Server {
         replyTo: optStr(body.replyTo),
         clientId: optStr(body.clientId),
         via: body.via,
+        basis: body.basis,
       }),
 
     'POST /api/v2/answers/take': ({ member, body }) =>
       engine.takeAnswers(member, { repoId: str(body.repoId, 'repoId'), question: str(body.question, 'question') }),
+
+    'GET /api/v2/notice': ({ member, query }) => engine.lookup(member, str(query.get('repoId'), 'repoId'), str(query.get('id'), 'id')),
 
     'GET /api/v2/inbox': ({ member, query }) => engine.inbox(member, str(query.get('repoId'), 'repoId'), ['1', 'true'].includes(query.get('all') ?? '')),
   };

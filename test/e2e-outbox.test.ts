@@ -320,13 +320,13 @@ test('沙箱里 .git 只读：命令行只读本地状态（last-session、membe
     assert.equal(await as(bob, 'notify', '--to', 'alice', '--summary', '只读时直连'), '已发给 alice。\n');
     assert.equal(latestNotice().sender_session_id, 'claude:bob-ro', '读得到 last-session.json');
     assert.match(await fails(bob, 'notify', '--to', 'alicee', '--summary', 'x'), /找不到成员：alicee/, '读得到 members.json');
-    assert.equal(await as(bob, 'reply', qid, '可以'), '已发给 alice。\n');
+    assert.equal(await as(bob, 'reply', qid, '可以', '--basis', '查证过'), '已发给 alice。\n');
   });
   assert.match(received(bob), /\n {4}✔ 已回答：可以\n/);
   // hook 刚连不上、写了退避标记：命令行只读它，直接存发件箱
   setBackoff(bob);
   await readOnly(async () => {
-    assert.equal(await as(bob, 'reply', qid, '再补一句'), `${QUEUED_TEXT}\n`);
+    assert.equal(await as(bob, 'reply', qid, '再补一句', '--basis', '查证过'), `${QUEUED_TEXT}\n`);
   });
   assert.match(received(bob), /\n {4}✔ 已回答（暂存，待补发）：再补一句\n/);
   assert.equal(outbox(bob).length, 1);
@@ -377,10 +377,10 @@ test('发件箱：还有待补发的、这个工作区又有会话开着时，�
   const qid = /· (n_[0-9a-f]+)：回测周期定的是多少天？/.exec(await postTool(alice, 'alice-order', 'codex'))?.[1] ?? assert.fail('alice 没收到提问');
   // 原回答在退避中暂存；退避过期以后、下一次 hook 之前，命令行接着发更正
   setBackoff(alice);
-  assert.equal(await as(alice, 'reply', qid, '是 1000 天'), `${QUEUED_TEXT}\n`);
+  assert.equal(await as(alice, 'reply', qid, '是 1000 天', '--basis', '查证过'), `${QUEUED_TEXT}\n`);
   clearBackoff(alice);
   const count = noticeCount();
-  const fix = await fetchesDuring(() => as(alice, 'reply', qid, '更正：是 2190 天'));
+  const fix = await fetchesDuring(() => as(alice, 'reply', qid, '更正：是 2190 天', '--basis', '查证过'));
   assert.equal(fix.result, `${BEHIND_TEXT}\n`);
   assert.deepEqual(fix.urls, [], '不直连');
   assert.equal(outbox(alice).length, 2);
@@ -398,7 +398,7 @@ test('发件箱：还有待补发的、这个工作区又有会话开着时，�
   assert.equal(outbox(w).length, 1);
   // 会话都结束了（最近一次 hook 是 session-end，比如退出时连不上服务器、暂存的没补发掉）：人在终端发的照旧直连，不会一直排在后面
   setBackoff(alice);
-  assert.equal(await as(alice, 'reply', qid, '退出前暂存的'), `${QUEUED_TEXT}\n`);
+  assert.equal(await as(alice, 'reply', qid, '退出前暂存的', '--basis', '查证过'), `${QUEUED_TEXT}\n`);
   await offline(() => hookRaw(alice, 'session-end', 'codex', { session_id: 'alice-order' }));
   clearBackoff(alice);
   assert.equal(outbox(alice).length, 1);
@@ -604,22 +604,22 @@ test('按 worktree 分开：回答先留给提问的会话——它还在线时�
   await hook(bob, 'session-start', 'claude', { session_id: 'bob-w1' });
   const q1 = await ask(bob, '回测周期按几小时算？');
   assert.equal(q1.sender_session_id, 'claude:bob-w1');
-  await as(alice, 'reply', q1.id, '按 4 小时');
+  await as(alice, 'reply', q1.id, '按 4 小时', '--basis', '查证过');
   // W2 的会话先触发：这条回答不给它，收尾检查也不因它拦下；inbox 照样看得到
   assert.equal(await stop(w2, 'codex', 'bob-w2'), null);
   assert.doesNotMatch(await postTool(w2, 'bob-w2', 'codex'), /按 4 小时/);
   assert.match(await as(w2, 'inbox'), /按 4 小时/);
   // W1 的会话下一次 hook 拿到，存进 W1 的 received.md
-  assert.match(await postTool(bob, 'bob-w1'), new RegExp(`\\n\\[1\\] 回答 · 来自 alice · 回复你的提问 ${q1.id}[^\\n]*：按 4 小时\\n`));
+  assert.match(await postTool(bob, 'bob-w1'), new RegExp(`\\n\\[1\\] 回答 · 来自 alice · 依据：查证过 · 回复你的提问 ${q1.id}[^\\n]*：按 4 小时\\n`));
   assert.ok(received(bob).includes(q1.id));
   // 提问的会话结束以后：再来的回答（比如更正）谁先来给谁
   await hookRaw(bob, 'session-end', 'claude', { session_id: 'bob-w1' });
-  await as(alice, 'reply', q1.id, '更正：按 1 小时');
+  await as(alice, 'reply', q1.id, '更正：按 1 小时', '--basis', '查证过');
   assert.match(await postTool(w2, 'bob-w2', 'codex'), /：更正：按 1 小时\n/);
   // 提问的会话 30 分钟以上没有活动（被杀掉、没收到 SessionEnd）：也一样
   await hook(bob, 'session-start', 'claude', { session_id: 'bob-w1-2' });
   const q2 = await ask(bob, '手续费按万几算？');
-  await as(alice, 'reply', q2.id, '万二');
+  await as(alice, 'reply', q2.id, '万二', '--basis', '查证过');
   assert.doesNotMatch(await postTool(w2, 'bob-w2', 'codex'), /万二/);
   engine.store.run("UPDATE sessions SET last_seen_at = ? WHERE id = 'claude:bob-w1-2'", new Date(Date.now() - 31 * MINUTE).toISOString());
   assert.match(await postTool(w2, 'bob-w2', 'codex'), /：万二\n/);
@@ -636,7 +636,7 @@ test('同一个工作区里同时开着几个会话：命令行分不清自己�
   const q = latestNotice();
   assert.equal(q.sender_session_id, null, '分不清是哪个会话发的');
   assert.match(await postTool(alice, 'alice-shared', 'codex'), /两个会话时问的/);
-  await as(alice, 'reply', q.id, '万二');
+  await as(alice, 'reply', q.id, '万二', '--basis', '查证过');
   // 回答不留给某一个会话：B 还开着，A 的下一次 hook 照样拿到（以前会被当成 B 问的，留给 B，A 连收尾检查都拿不到）
   assert.match(await postTool(bob, 'bob-a'), /：万二\n/);
   // B 结束以后，只剩 A：照常归属

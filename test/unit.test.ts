@@ -16,7 +16,7 @@ import { clearAcks, pendingAcks, saveAcks } from '../src/connector/state.ts';
 import { claimError, INJECTION_BUDGET_BYTES, memberNameError, type Claim, type Teammate } from '../src/shared/protocol.ts';
 import { CONNECTED_TEXT, HEADER, normalizeText, renderBatch, renderEntry, renderOthers, renderTeammate, renderTeammates, type RenderItem } from '../src/shared/render.ts';
 import { DEFAULT_POLICY } from '../src/shared/rules.ts';
-import { rejectionMessage, reviewMessage } from '../src/server/review.ts';
+import { rejectionMessage, reviewMessage } from '../src/shared/review.ts';
 
 const tmp = mkdtempSync(join(tmpdir(), 'teamlink-unit-'));
 after(() => rmSync(tmp, { recursive: true, force: true }));
@@ -52,7 +52,7 @@ const message: RenderItem = {
 test('渲染：提问、回答、消息的格式（变更类型用中文）', () => {
   assert.equal(
     renderEntry(question, 1),
-    '[1] 提问 · 来自 阿明 · n_q1：你那边 compare 的返回字段定了吗？\n    回答：teamlink reply n_q1 "…"（只有你的用户知道的，先在对话里问他；写明依据：用户说的、本机查到的，还是你的推测）',
+    '[1] 提问 · 来自 阿明 · n_q1：你那边 compare 的返回字段定了吗？\n    回答：teamlink reply n_q1 "…" --basis 本人确认|查证过|推测（只有你的用户知道的，先在对话里问他，不要替他猜）',
   );
   // 回答带上提问的前 30 个字，多的写“…”
   assert.equal(renderEntry(answer, 2), '[2] 回答 · 来自 丽丽 · 回复你的提问 n_yyy「比较接口的差值方向是 a−b 还是 b−a？另外字段名叫什么…」：定了，返回 diff 和 direction。');
@@ -582,7 +582,11 @@ test('received.md：只存消息条目，最新的在最前面，最多 30 批',
 // —— 这一版加的：本人写的标记、--wait 的解析 ——
 
 test('谁写的：本人在终端里写的在名字后面标“（本人写的）”，AI 会话发的和旧连接器发的不标；成员名里不能带这个标记', () => {
-  assert.equal(renderEntry({ ...message, claims: [], via: 'person' }, 1), '[1] 消息 · 来自 大伟（本人写的）：回测对比接口改好了');
+  // 本人写的消息可以记进团队事实：下面多一行怎么记
+  assert.equal(
+    renderEntry({ ...message, claims: [], via: 'person' }, 1),
+    '[1] 消息 · 来自 大伟（本人写的）：回测对比接口改好了\n    是长期有效的事实（限额、口径、约定这类）就记下来：teamlink fact "主题" --from n_m1',
+  );
   assert.match(renderEntry({ ...question, via: 'person' }, 1), /^\[1\] 提问 · 来自 阿明（本人写的） · n_q1：/);
   assert.match(renderEntry({ ...answer, via: 'person' }, 2), /^\[2\] 回答 · 来自 丽丽（本人写的） · 回复你的提问 n_yyy/);
   for (const via of ['ai', null, undefined] as const) assert.equal(renderEntry({ ...message, claims: [], via }, 1), '[1] 消息 · 来自 大伟：回测对比接口改好了');

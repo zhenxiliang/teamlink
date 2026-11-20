@@ -4,7 +4,7 @@
 // ask --wait：提问发出去、对方又在线时，在这条命令里等回答，到了直接打印（见 waitForAnswer）。
 
 import { randomUUID } from 'node:crypto';
-import type { Claim, NoticeType, NoticeVia, SendResponse, TakeAnswersResponse } from '../shared/protocol.ts';
+import type { Basis, Claim, NoticeType, NoticeVia, SendResponse, TakeAnswersResponse } from '../shared/protocol.ts';
 import { claimError, MAX_CLAIMS, MAX_SUMMARY_CHARS, TOOLS } from '../shared/protocol.ts';
 import { normalizeText } from '../shared/render.ts';
 import { call, ClientError, NetworkError } from './client.ts';
@@ -12,7 +12,7 @@ import type { Identity, RepoConfig } from './config.ts';
 import { installedTools } from './install.ts';
 import { originOf } from './origin.ts';
 import { OUTBOX_DIR, outboxCounts, reasonText, REJECTED, saveToOutbox, sentText } from './outbox.ts';
-import { markAnswer, saveReceived, type AnswerState } from './received.ts';
+import { markAnswer, saveItems, saveReceived, type AnswerState } from './received.ts';
 import { backoffActive, lastHookRun, loadLastSession, loadMembers, openSessions, stateDirOf, stuckReason } from './state.ts';
 
 export interface Outgoing {
@@ -25,6 +25,8 @@ export interface Outgoing {
   replyTo?: string;
   /** 谁写的；不写就按运行环境判断（AI 会话里发的，还是本人在终端里写的）。 */
   via?: NoticeVia;
+  /** 回答的依据（只有回答带）。 */
+  basis?: Basis;
 }
 
 /** 发送的结果：打印给 AI 的回执；直连发出去了的话带上服务器的响应（暂存进发件箱时为 null）。 */
@@ -118,7 +120,7 @@ export async function send(root: string, cfg: RepoConfig, identity: Identity, in
     type: input.type,
     summary,
     claims: input.claims,
-    ...(input.type === 'answer' ? { replyTo: input.replyTo } : { to }),
+    ...(input.type === 'answer' ? { replyTo: input.replyTo, ...(input.basis ? { basis: input.basis } : {}) } : { to }),
     // 谁写的：存进发件箱的也带着，补发时还是当时判断的结果
     via: input.via ?? originOf(),
     // 直连超时、改存发件箱后再补发时，服务器可能其实已经收到了：凭这个编号去重
@@ -188,6 +190,7 @@ export async function waitForAnswer(root: string, cfg: RepoConfig, identity: Ide
     if (Array.isArray(res.ids) && res.ids.length > 0 && res.text) {
       try {
         saveReceived(root, res.text, res.ids.length);
+        if (Array.isArray(res.items)) saveItems(root, res.items);
       } catch {
         // 存档只是方便回看，写不了就算了
       }

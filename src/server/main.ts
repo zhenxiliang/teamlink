@@ -13,6 +13,7 @@ import { createApi, type TlsMaterial } from './api.ts';
 import { INVITE_DAYS, Store } from './db.ts';
 import { DEFAULT_CONFIG, Engine, type EngineConfig } from './engine.ts';
 import { loadPolicy, savePolicy } from './policy.ts';
+import { renderStats, repoStats } from './stats.ts';
 
 /** 打开数据目录里的库（旧结构会先迁移，失败时抛错）。 */
 export function openEngine(dataDir: string, overrides: Partial<Omit<EngineConfig, 'dataDir'>> = {}): Engine {
@@ -183,6 +184,7 @@ const USAGE = `用法：
   teamlink-server remove-member --name 名字 [--data 目录]   移出成员：他的设备全部失效，名字空出来
   teamlink-server revoke-device --device 设备ID [--data 目录]
                                                            吊销一台设备（电脑丢了、私钥泄露），成员还在
+  teamlink-server stats [--days 30] [--data 目录]          团队问答的统计：回答率、回答用时、依据、被问得最多的人、可能重复的提问
   teamlink-server policy [--allow-domain 域名] [--remove-domain 域名] [--data 目录]
                                                            查看或修改消息里允许出现的链接域名；不带参数时打印当前名单
   teamlink-server start [--port 7420] [--host 127.0.0.1] [--data 目录] [--cert 证书.pem --key 私钥.pem]
@@ -237,7 +239,7 @@ export async function runServerCli(argv: string[]): Promise<void> {
     console.log(USAGE);
     return;
   }
-  if (!['init', 'add-repo', 'invite', 'members', 'rename-member', 'remove-member', 'revoke-device', 'policy', 'start'].includes(cmd)) {
+  if (!['init', 'add-repo', 'invite', 'members', 'rename-member', 'remove-member', 'revoke-device', 'stats', 'policy', 'start'].includes(cmd)) {
     console.log(USAGE);
     process.exitCode = 1;
     return;
@@ -307,6 +309,15 @@ export async function runServerCli(argv: string[]): Promise<void> {
       const owner = r.member?.name ?? '已移出的成员';
       console.log(`已吊销 ${owner} 的设备 ${r.device.id}${r.device.name ? `（${r.device.name}）` : ''}，这台设备的请求从现在起被拒绝。`);
       if (r.member) console.log(r.left > 0 ? `${owner} 还有 ${r.left} 台设备可用。` : `${owner} 没有可用的设备了：teamlink-server invite --for ${owner} 生成给他加设备的邀请码。`);
+      break;
+    }
+    case 'stats': {
+      // --days 和邀请码共用一个参数名：没写时 parseArgs 给的是邀请码的默认值，这里按统计的默认值算
+      const days = argv.some((a) => a === '--days' || a.startsWith('--days=')) ? Number(values.days) : engine.config.retentionDays;
+      if (!Number.isInteger(days) || days < 1 || days > 365) throw new Error('--days 要是 1 到 365 之间的整数');
+      const repos = engine.store.repos();
+      console.log(repos.length === 0 ? '还没有登记仓库。' : repos.map((r) => renderStats(repoStats(engine.store, r, days), days)).join('\n\n'));
+      if (days > engine.config.retentionDays) console.error(`消息只保留 ${engine.config.retentionDays} 天，更早的已经删掉了，不在统计里。`);
       break;
     }
     case 'policy': {

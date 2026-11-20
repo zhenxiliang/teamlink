@@ -15,7 +15,7 @@ import { DEFAULT_POLICY } from '../src/shared/rules.ts';
 import { SCHEMA_VERSION } from '../src/server/db.ts';
 import { certNames, openEngine, startServer } from '../src/server/main.ts';
 import { loadPolicy } from '../src/server/policy.ts';
-import { reviewMessage } from '../src/server/review.ts';
+import { reviewMessage } from '../src/shared/review.ts';
 import { as, bash, cli, DAY, delivered, devs, engine, memberId, MINUTE, reply, repoId, ROOT, run, server, SERVER_BIN, serverLog, signed, signedAt, sleep, stop, tmp, write } from './helpers.ts';
 
 // —— 15. 迁移 ——
@@ -636,6 +636,9 @@ test('升级：上一版（结构版本 2）的库原地加列升到 3——成�
     const cols = (table: string) => e.store.all<{ name: string }>(`PRAGMA table_info(${table})`).map((c) => c.name);
     assert.ok(cols('recipients').includes('acked_at') && cols('recipients').includes('attempts'));
     assert.ok(cols('notices').includes('via'));
+    // 0.3 加的回答依据：只加列（addColumns），结构版本还是 3，上一版的服务器照样能打开
+    assert.ok(cols('notices').includes('basis'));
+    assert.equal(userVersion(path), 3);
     assert.deepEqual(
       e.store.all<{ notice_id: string; acked: number; attempts: number }>('SELECT notice_id, acked_at IS NOT NULL AS acked, attempts FROM recipients ORDER BY notice_id').map((r) => ({ ...r })),
       [

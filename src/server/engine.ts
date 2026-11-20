@@ -10,6 +10,7 @@ import type {
   DeliveryResponse,
   InboxResponse,
   JoinResponse,
+  NoticeItem,
   NoticeType,
   NoticeVia,
   Presence,
@@ -19,12 +20,12 @@ import type {
   Teammate,
   Tool,
 } from '../shared/protocol.ts';
-import { claimError, INJECTION_BUDGET_BYTES, MAX_ACKS, MAX_CLAIMS, MAX_SUMMARY_CHARS, memberNameError, VIAS } from '../shared/protocol.ts';
+import { BASES, claimError, INJECTION_BUDGET_BYTES, MAX_ACKS, MAX_CLAIMS, MAX_SUMMARY_CHARS, memberNameError, VIAS, type Basis } from '../shared/protocol.ts';
 import { excerpt, normalizeText, renderBatch, type RenderItem } from '../shared/render.ts';
 import { DEFAULT_POLICY, type Policy } from '../shared/rules.ts';
 import { newId, SYSTEM_SENDER, type DeviceInfo, type MemberRow, type Notice, type QueuedNotice, type RepoRow, type Store, type UndeliveredRow } from './db.ts';
 import { loadPolicy } from './policy.ts';
-import { rejectionMessage, reviewMessage } from './review.ts';
+import { rejectionMessage, reviewMessage } from '../shared/review.ts';
 
 const DAY = 24 * 3600_000;
 /** 开工时列 7 天内有过会话的队友，最多 8 人。 */
@@ -109,6 +110,8 @@ export interface SendInput {
   clientId: string | null;
   /** 谁写的（AI 会话 / 本人在终端）：连接器报的，不认识的值当作没报。 */
   via?: unknown;
+  /** 回答的依据（confirmed、checked、guess）：只有回答能带；不认识的值报错，免得依据悄悄丢掉。 */
+  basis?: unknown;
 }
 
 const toItem = (n: QueuedNotice): RenderItem => ({
@@ -119,7 +122,14 @@ const toItem = (n: QueuedNotice): RenderItem => ({
   claims: n.claims,
   replyTo: n.reply_to ? { id: n.reply_to, question: n.question ?? '' } : null,
   via: n.via,
+  basis: n.basis ?? null,
 });
+
+/** 送达响应里带的结构化内容：连接器存起来，teamlink fact --from 用。 */
+const toNoticeItem = (n: QueuedNotice): NoticeItem => {
+  const r = toItem(n);
+  return { id: r.id, type: r.type, sender: r.sender, via: r.via ?? null, basis: r.basis ?? null, summary: r.summary, replyTo: r.replyTo ?? null, createdAt: n.created_at };
+};
 
 export class Engine {
   readonly store: Store;
@@ -396,6 +406,7 @@ export class Engine {
         hasMessages: sent.length > 0,
         // 每次都带：会话中途有人加入时，命令行的名单下一次 hook 就更新（内容没变连接器不写盘）
         members: names,
+        items: sent.map(toNoticeItem),
       };
     });
   }
@@ -432,6 +443,7 @@ export class Engine {
         text: answers.length > 0 ? renderBatch({ items: answers.map(toItem), budgetBytes: Infinity, now: this.store.clock() }).text : '',
         ids: answers.map((n) => n.id),
         online: asked.some((id) => this.presence(id, p.repoId).online),
+        items: answers.map(toNoticeItem),
       };
     });
   }
@@ -474,6 +486,11 @@ export class Engine {
 
     const { to, replyTo } = type === 'answer' ? this.answerTarget(member, repo.id, input.replyTo as string) : { to: this.namedRecipients(member, input.to), replyTo: null };
     const via: NoticeVia | null = VIAS.includes(input.via as NoticeVia) ? (input.via as NoticeVia) : null;
+    if (input.basis !== undefined && input.basis !== null && !BASES.includes(input.basis as Basis)) {
+      throw new ApiError(400, `basis 必须是 ${BASES.join('、')} 之一`);
+    }
+    // 只有回答有依据：提问和消息带了也不存
+    const basis = type === 'answer' ? ((input.basis as Basis | null | undefined) ?? null) : null;
 
     const reasons = reviewMessage([summary, ...claims.map((c) => `${c.file}#${c.symbol}`)], this.policy().allowDomains);
     if (reasons.length > 0) {
@@ -508,11 +525,12 @@ export class Engine {
           client_id: input.clientId,
           created_at: this.store.now(),
           via,
+          basis,
         },
         to.map((m) => m.id),
       ),
     );
-    this.event('notice_sent', { id: n.id, type, from: member.name, to: n.to_names, ...(via ? { via } : {}) });
+    this.event('notice_sent', { id: n.id, type, from: member.name, to: n.to_names, ...(via ? { via } : {}), ...(basis ? { basis } : {}) });
     return this.sendResult(n);
   }
 
@@ -581,6 +599,36 @@ export class Engine {
   }
 
   // —— 查看 ——
+
+  /**
+   * teamlink fact --from 在本机存档里找不到时来查：一条自己发的或者收到的通知。
+   * 是自己发的提问时返回它最新的一条回答（同一条提问可以回答多次来更正，以最新的为准）。
+   */
+  lookup(member: MemberRow, repoId: string, id: string): NoticeItem {
+    this.requireRepo(repoId);
+    const shown = normalizeText(id, true).slice(0, 40);
+    const n = this.store.notice(id);
+    if (!n || n.repo_id !== repoId) throw new ApiError(404, `找不到通知 ${shown}`);
+    if (n.sender_member_id !== member.id && !this.store.isRecipient(n.id, member.id)) throw new ApiError(403, '只能查自己发的或者收到的通知');
+    let target: Notice = n;
+    if (n.type === 'question') {
+      if (n.sender_member_id !== member.id) throw new ApiError(400, `${shown} 是别人问你的提问，不是事实`);
+      const answer = this.store.get<{ id: string }>("SELECT id FROM notices WHERE reply_to = ? AND type = 'answer' ORDER BY created_at DESC, rowid DESC LIMIT 1", n.id);
+      if (!answer) throw new ApiError(404, `提问 ${shown} 还没有回答`);
+      target = this.store.notice(answer.id) as Notice;
+    }
+    const question = target.reply_to ? this.store.notice(target.reply_to) : undefined;
+    const sender = this.store.member(target.sender_member_id);
+    return toNoticeItem({
+      ...target,
+      sender_name: sender?.name ?? null,
+      question: question?.summary ?? null,
+      asker_session: null,
+      delivered_at: null,
+      delivered_session: null,
+      attempts: 0,
+    });
+  }
 
   /**
    * teamlink inbox：只看，不记送达，不受注入预算限制。默认看还没交给过 AI 会话的

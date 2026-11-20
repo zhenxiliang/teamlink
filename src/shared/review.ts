@@ -1,8 +1,10 @@
-// 发送时的审核（在服务器端）：只拒收高置信的危险内容——密钥和令牌、明显的指令注入、命令、陌生链接、长串编码。
-// 拒收时把原因退给发送方，让它改写；其余一律放行，不分等级，也不改动内容。
+// 内容审核。两处用：
+// - 发消息（服务器端，reviewMessage）：只拒收高置信的危险内容——密钥和令牌、明显的指令注入、命令、陌生链接、长串编码。
+//   拒收时把原因退给发送方，让它改写；其余一律放行，不分等级，也不改动内容。
+// - 记团队事实（连接器，reviewFact）：只拦密钥和注入，见 reviewFact。
 
-import { LINE_BREAKS, normalizeText } from '../shared/render.ts';
-import { domainAllowed } from '../shared/rules.ts';
+import { LINE_BREAKS, normalizeText } from './render.ts';
+import { domainAllowed } from './rules.ts';
 
 type Rule = [RegExp, string];
 
@@ -126,4 +128,16 @@ function check(joined: string, allowDomains: string[]): string[] {
 /** 拒收时退给发送方的话（422 的正文）。 */
 export function rejectionMessage(reasons: string[]): string {
   return `这条消息没有发出：里面有${reasons.join('、')}。请改写后重发：只写事实，不带命令、代码块和链接；需要对方改依赖、CI、权限，或者涉及密钥的，请你的用户直接和对方沟通。`;
+}
+
+/**
+ * 记进团队事实之前查一遍（在连接器里查，沙箱里连不上服务器也能查）。事实要提交进仓库、经过 PR 审查，
+ * 命令、代码、链接都可能是正当的事实（“部署前要先跑迁移”“文档在 docs.example.com”），所以只拦两类：
+ * 密钥和令牌（进了 git 历史就很难删干净），以及注入的话（之后每个 AI 都会读到它）。返回原因，空数组表示可以记。
+ */
+export function reviewFact(texts: string[]): string[] {
+  const text = texts.join('\n').replace(LINE_BREAKS, '\n').replace(INVISIBLE, '');
+  const reasons = [...hits(SECRETS, text), ...hits(INJECTION, text), ...hits(INJECTION, text.normalize('NFKC'))];
+  if ([...text.matchAll(ENV_SECRET)].some((m) => secretValue(m[4]))) reasons.push(ENV_SECRET_WHY);
+  return [...new Set(reasons)];
 }

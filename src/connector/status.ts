@@ -1,6 +1,6 @@
 // teamlink status：一次查清真实出现过的几种故障——身份和仓库关联、服务器能不能连上（两边的协议版本）、
 // hook 装没装、从图形界面启动的 AI 工具能不能找到 node、hook 最近有没有跑（配置改过以后还没跑过，多半是 Codex 还没信任）、
-// 发件箱积压、hook 的错误日志。
+// 发件箱积压、hook 的错误日志；顺带报一下仓库里有几条团队事实。
 
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
@@ -11,6 +11,7 @@ import { PROTOCOL } from '../shared/protocol.ts';
 import { call, message } from './client.ts';
 import { identityFor, loadIdentities, readRepoConfig, REPO_CONFIG, repoRoot, teamlinkHome, type RepoConfig } from './config.ts';
 import { CLAUDE_HOOKS, CODEX_HOOKS, hookCommand, isTeamlinkEntry, launcherPath, readHookConfig, type HookConfig, type WantedHook } from './install.ts';
+import { FACTS_DIR, loadFacts } from './facts.ts';
 import { ago, outboxCounts, OUTBOX_DIR } from './outbox.ts';
 import { localTime } from './received.ts';
 import { hookErrorLog, lastHookRun, stateDirOf } from './state.ts';
@@ -141,6 +142,8 @@ export async function status(cwd: string, out: (s: string) => void): Promise<voi
     lastRuns(root, tools, out);
     const n = outboxCounts(root);
     out(`发件箱：${n.pending} 条待补发，${OUTBOX_DIR}/failed/ 里 ${n.failed} 条被退回的${n.failed > 0 ? '（原件，看过可以删掉）' : ''}`);
+    const facts = loadFacts(root).length;
+    out(`团队事实：${FACTS_DIR}/ 里 ${facts} 条${facts === 0 ? '（AI 收到本人确认、查证过的长期事实时用 teamlink fact 记）' : '（teamlink facts 列出）'}`);
   }
   const log = hookErrorLog();
   const tail = existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).slice(-3) : [];

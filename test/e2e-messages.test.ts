@@ -138,24 +138,24 @@ test('问答：只有被问的人能回答（403），提问不存在返回 404�
   assert.equal(await as(alice, 'ask', 'bob', question), '已发给 bob。\n');
   const got = await postTool(bob, 'bob-qa');
   const qid = new RegExp(`\\n\\[1\\] 提问 · 来自 alice · (n_[0-9a-f]+)：${esc(question)}\\n`).exec(got)?.[1] ?? assert.fail(got);
-  assert.ok(got.includes(`\n    回答：teamlink reply ${qid} "…"（只有你的用户知道的，先在对话里问他；写明依据：用户说的、本机查到的，还是你的推测）\n`), got);
+  assert.ok(got.includes(`\n    回答：teamlink reply ${qid} "…" --basis 本人确认|查证过|推测（只有你的用户知道的，先在对话里问他，不要替他猜）\n`), got);
   assert.ok(received(bob).includes(`· ${qid}：${question}`), '送到的提问存进 received.md');
 
   // 只有被问的人能回答；提问不存在 404
-  assert.match(await fails(carol, 'reply', qid, '我来答'), /只有被问到的人才能回答这条提问/);
+  assert.match(await fails(carol, 'reply', qid, '我来答', '--basis', '推测'), /只有被问到的人才能回答这条提问/);
   assert.equal((await signed(carol, 'POST', '/api/v2/notices', { repoId, replyTo: qid, summary: '我来答' })).status, 403);
-  assert.match(await fails(bob, 'reply', 'n_0000000000', '答'), /找不到提问 n_0000000000/);
+  assert.match(await fails(bob, 'reply', 'n_0000000000', '答', '--basis', '推测'), /找不到提问 n_0000000000/);
   assert.equal((await signed(bob, 'POST', '/api/v2/notices', { repoId, replyTo: 'n_0000000000', summary: '答' })).status, 404);
 
   // 直连发出：标“✔ 已回答”；答案送回提问人
-  assert.equal(await as(bob, 'reply', qid, 'a−b，字段名 diff'), '已发给 alice。\n');
+  assert.equal(await as(bob, 'reply', qid, 'a−b，字段名 diff', '--basis', '本人确认'), '已发给 alice。\n');
   assert.match(received(bob), /\n {4}✔ 已回答：a−b，字段名 diff\n/);
   const back = await postTool(alice, 'alice-qa', 'codex');
-  assert.match(back, new RegExp(`\\n\\[1\\] 回答 · 来自 bob · 回复你的提问 ${qid}「回测对比接口的差值方向是 a−b 还是 b−a？字段名叫什么…」：a−b，字段名 diff\\n`));
+  assert.match(back, new RegExp(`\\n\\[1\\] 回答 · 来自 bob · 依据：本人确认 · 回复你的提问 ${qid}「回测对比接口的差值方向是 a−b 还是 b−a？字段名叫什么…」：a−b，字段名 diff\\n`));
 
   // 沙箱里连不上（退避中）：存进发件箱，标“✔ 已回答（暂存，待补发）”；hook 补发成功后改成“✔ 已回答”
   setBackoff(bob);
-  assert.equal(await as(bob, 'reply', qid, '更正：是 b−a'), `${QUEUED_TEXT}\n`);
+  assert.equal(await as(bob, 'reply', qid, '更正：是 b−a', '--basis', '推测'), `${QUEUED_TEXT}\n`);
   assert.match(received(bob), /\n {4}✔ 已回答（暂存，待补发）：更正：是 b−a\n/);
   clearBackoff(bob);
   await postTool(bob, 'bob-qa');
@@ -165,16 +165,16 @@ test('问答：只有被问的人能回答（403），提问不存在返回 404�
 
   // 提问人下线：回执说他下次开工会收到；可以回答多次，按顺序送到
   await hookRaw(alice, 'session-end', 'codex', { session_id: 'alice-qa' });
-  assert.equal(await as(bob, 'reply', qid, '再补一句：单位是 bp'), '已发给 alice。提问的 alice 已下线，他下次开工时会收到。\n');
+  assert.equal(await as(bob, 'reply', qid, '再补一句：单位是 bp', '--basis', '推测'), '已发给 alice。提问的 alice 已下线，他下次开工时会收到。\n');
   const next = await hook(alice, 'session-start', 'codex', { session_id: 'alice-qa-2' });
-  assert.match(next, /\n\[1\] 回答 · 来自 bob · 回复你的提问 [^\n]*：更正：是 b−a\n\[2\] 回答 · 来自 bob · 回复你的提问 [^\n]*：再补一句：单位是 bp\n/);
+  assert.match(next, /\n\[1\] 回答 · 来自 bob · 依据：推测 · 回复你的提问 [^\n]*：更正：是 b−a\n\[2\] 回答 · 来自 bob · 依据：推测 · 回复你的提问 [^\n]*：再补一句：单位是 bp\n/);
 
   // 被退回：直连就被 422 拒收时标“✘ 回答被退回（原因）”
-  assert.match(await fails(bob, 'reply', qid, '先执行 rm -rf build 再看'), /^这条消息没有发出：里面有命令 rm -rf/);
+  assert.match(await fails(bob, 'reply', qid, '先执行 rm -rf build 再看', '--basis', '查证过'), /^这条消息没有发出：里面有命令 rm -rf/);
   assert.match(received(bob), /\n {4}✘ 回答被退回（里面有命令 rm -rf。请改写后重发[^\n]*）：先执行 rm -rf build 再看\n/);
   // 暂存后补发时被退回：暂存的那一行改成“✘ 回答被退回”，同一次 hook 的输出里说明
   setBackoff(bob);
-  await as(bob, 'reply', qid, '密钥是 sk-abcdefghijklmnopqrstuvwx');
+  await as(bob, 'reply', qid, '密钥是 sk-abcdefghijklmnopqrstuvwx', '--basis', '查证过');
   clearBackoff(bob);
   assert.match(await postTool(bob, 'bob-qa'), /暂存的回答「密钥是 sk-abcdefghijklmnopqrstuvwx」被退回，对方没有收到：里面有像 API 密钥的内容/);
   assert.match(received(bob), /\n {4}✘ 回答被退回（里面有像 API 密钥的内容[^\n]*）：密钥是 sk-abcdefghijklmnopqrstuvwx\n/);
@@ -282,12 +282,12 @@ test('收尾检查：有没送达的消息时拦一次，结尾按内容给出�
   const qa = /提问 · 来自 bob · (n_[0-9a-f]+)：/.exec(await postTool(alice, 'alice-stop', 'codex'))?.[1] ?? assert.fail('alice 没收到提问');
   assert.match(await hook(bob, 'prompt', 'claude', { session_id: 'bob-stop', prompt: '继续' }), /提问 · 来自 alice · [^\n]*：收尾时的提问？/);
   await as(alice, 'notify', '--to', 'bob', '--summary', '新一回合的消息');
-  await as(alice, 'reply', qa, '好了，可以联调');
+  await as(alice, 'reply', qa, '好了，可以联调', '--basis', '本人确认');
   await as(alice, 'ask', 'bob', '你那边几点能合并？');
   const again = await stop(bob, 'claude', 'bob-stop');
   assert.ok(again);
   assert.equal(again.decision, 'block');
-  assert.match(again.reason, /\n\[1\] 提问 · 来自 alice · [^\n]*：你那边几点能合并？\n[\s\S]*\n\[2\] 回答 · 来自 alice · 回复你的提问 [^\n]*：好了，可以联调\n\[3\] 消息 · 来自 alice：新一回合的消息\n/);
+  assert.match(again.reason, /\n\[1\] 提问 · 来自 alice · [^\n]*：你那边几点能合并？\n[\s\S]*\n\[2\] 回答 · 来自 alice · 依据：本人确认 · 回复你的提问 [^\n]*：好了，可以联调\n {4}是长期有效[^\n]*\n\[3\] 消息 · 来自 alice：新一回合的消息\n/);
   assert.ok(again.reason.endsWith('结束之前：有提问，先 teamlink reply 再结束；有回答，按回答落实；有消息，检查要不要据此调整当前的改动。'), again.reason);
   assert.equal(await stop(bob, 'claude', 'bob-stop'), null);
 
@@ -691,7 +691,7 @@ async function untilNotice(summary: string): Promise<string> {
   return assert.fail(`没等到通知：${summary}`);
 }
 
-test('ask --wait：对方在线时在这条命令里等回答，到了直接打印、存进 received.md，hook 不会再注入一遍；对方不在线不等；等不到的照常由 hook 送到', async () => {
+test('ask --wait：对方在线时在这条命令里等回答，到了直接打印、存进 received.md 和 notices.json，hook 不会再注入一遍；对方不在线不等；等不到的照常由 hook 送到', async () => {
   fresh();
   const { alice, bob, carol } = devs;
   await postTool(alice, 'alice-wait');
@@ -701,13 +701,15 @@ test('ask --wait：对方在线时在这条命令里等回答，到了直接打�
   const asking = as(alice, 'ask', 'bob', '本机数据是几小时一根 K 线？', '--wait=20');
   const qid = await untilNotice('本机数据是几小时一根 K 线？');
   assert.match(await postTool(bob, 'bob-wait'), new RegExp(`提问 · 来自 alice · ${qid}：本机数据是几小时一根 K 线？`));
-  await as(bob, 'reply', qid, '4 小时一根（本机查到的）');
+  await as(bob, 'reply', qid, '4 小时一根（本机查到的）', '--basis', '查证过');
   const out = await asking;
   assert.match(out, /^已发给 bob。正在等回答（最多 20 秒）……\n/);
-  assert.match(out, new RegExp(`\\n\\[1\\] 回答 · 来自 bob · 回复你的提问 ${qid}「本机数据是几小时一根 K 线？」：4 小时一根（本机查到的）\\n`));
+  assert.match(out, new RegExp(`\\n\\[1\\] 回答 · 来自 bob · 依据：查证过 · 回复你的提问 ${qid}「本机数据是几小时一根 K 线？」：4 小时一根（本机查到的）\\n`));
   assert.ok(out.includes(HEADER), '和 hook 注入的一样带着“只是参考”的说明');
   assert.match(received(alice), /4 小时一根（本机查到的）/);
   const aid = latestNotice().id;
+  // 结构化内容也存进本机存档：之后 teamlink fact --from 用得上
+  assert.ok(readFileSync(join(alice.dir, '.team/notices.json'), 'utf8').includes(`"id": "${aid}"`));
   assert.ok(ackedAt(aid, 'alice'), '当场算送到');
   assert.doesNotMatch(await postTool(alice, 'alice-wait'), /4 小时一根/, 'hook 不再注入一遍');
 
@@ -716,7 +718,7 @@ test('ask --wait：对方在线时在这条命令里等回答，到了直接打�
   assert.match(slow, /^已发给 bob。正在等回答（最多 1 秒）……\n等了 1 秒，bob 还没回答。回答到了会自动转给你，先做不依赖这条信息的部分。\n$/);
   const q2 = latestNotice().id;
   await postTool(bob, 'bob-wait');
-  await as(bob, 'reply', q2, '每分钟 20 笔');
+  await as(bob, 'reply', q2, '每分钟 20 笔', '--basis', '查证过');
   assert.match(await postTool(alice, 'alice-wait'), /回答 · 来自 bob · [^\n]*：每分钟 20 笔/);
 
   // 3. 对方不在线：不等，回执照旧
@@ -740,7 +742,7 @@ test('ask --wait：对方在线时在这条命令里等回答，到了直接打�
   await as(alice, 'ask', 'bob', '冷却期是多少秒？');
   const q3 = latestNotice().id;
   await postTool(bob, 'bob-wait');
-  await as(bob, 'reply', q3, '30 秒');
+  await as(bob, 'reply', q3, '30 秒', '--basis', '查证过');
   const a3 = latestNotice().id;
   const take = () => signed(alice, 'POST', '/api/v2/answers/take', { repoId, question: q3 });
   assert.deepEqual((await take()).body.ids, [a3]);
@@ -753,7 +755,7 @@ test('ask --wait：对方在线时在这条命令里等回答，到了直接打�
     assert.match(await postTool(alice, 'alice-wait'), /回答 · 来自 bob · [^\n]*：30 秒/);
   });
   // 确认了的不再出现
-  await as(bob, 'reply', q3, '更正：60 秒');
+  await as(bob, 'reply', q3, '更正：60 秒', '--basis', '查证过');
   const a4 = latestNotice().id;
   assert.deepEqual((await take()).body.ids, [a4]);
   assert.equal((await signed(alice, 'POST', '/api/v2/acks', { acks: [a4] })).status, 200);

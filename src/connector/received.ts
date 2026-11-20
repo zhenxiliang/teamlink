@@ -1,12 +1,14 @@
 // .team/received.md：hook 每次送到的队友消息，在工作区里存一份（只在本机，不提交），最新的在最前面。
 // 沙箱里的 AI 读得到它，怀疑漏了消息时看这里。只存消息条目（带边界标签和通知号），
 // 队友段、“另有 N 条”、平台提示都不写进来；回答过的提问下面加一行标记，免得重复回答。
+// .team/notices.json：同一批消息的结构化内容（发送人、本人写的、依据、原文、回的哪条提问），给 teamlink fact --from 用。
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import type { NoticeItem } from '../shared/protocol.ts';
 import { excerpt } from '../shared/render.ts';
 import { excludeLocally } from './config.ts';
-import { withLock, writeAtomic } from './state.ts';
+import { readJson, withLock, writeAtomic } from './state.ts';
 
 export const RECEIVED_FILE = '.team/received.md';
 /** 最多留这么多批、这么多字节，超了就丢掉最旧的批次（最新的一批总是留着）。 */
@@ -90,4 +92,49 @@ export function markAnswer(root: string, questionId: string, state: AnswerState,
 export function latestBatches(root: string, n: number): string[] {
   const path = join(root, RECEIVED_FILE);
   return existsSync(path) ? batchesOf(readFileSync(path, 'utf8')).slice(0, n) : [];
+}
+
+// —— 结构化存档 ——
+
+export const NOTICES_FILE = '.team/notices.json';
+/** 最多留这么多条，超了丢最旧的。 */
+const MAX_ITEMS = 500;
+
+function isItem(x: unknown): x is NoticeItem {
+  const i = x as NoticeItem;
+  return Boolean(i) && typeof i.id === 'string' && typeof i.type === 'string' && typeof i.sender === 'string' && typeof i.summary === 'string';
+}
+
+function loadItems(root: string): NoticeItem[] {
+  const all = readJson<unknown[]>(join(root, NOTICES_FILE));
+  return Array.isArray(all) ? all.filter(isItem) : [];
+}
+
+/** 存一批送到的消息的结构化内容（最新的在最前面；重发的同一条只留一份）。 */
+export function saveItems(root: string, items: unknown[]): void {
+  const fresh = items.filter(isItem);
+  if (fresh.length === 0) return;
+  withLock(join(root, '.team', '.notices.lock'), () => {
+    const ids = new Set(fresh.map((i) => i.id));
+    const next = [...fresh, ...loadItems(root).filter((i) => !ids.has(i.id))].slice(0, MAX_ITEMS);
+    writeAtomic(join(root, NOTICES_FILE), `${JSON.stringify(next, null, 1)}\n`);
+  });
+  try {
+    excludeLocally(root, '.team/');
+  } catch {
+    // 同 received.md
+  }
+}
+
+/**
+ * 在存档里找一条：通知号对上的那一条；没有的话，当它是自己问过的提问，找回它的最新一条回答
+ * （回答在注入里显示的是提问的号，AI 手里多半是它）。找不到返回 null。
+ */
+export function findItem(root: string, id: string): NoticeItem | null {
+  const all = loadItems(root);
+  const exact = all.find((i) => i.id === id);
+  if (exact) return exact;
+  const answers = all.filter((i) => i.type === 'answer' && i.replyTo?.id === id);
+  answers.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+  return answers[0] ?? null;
 }

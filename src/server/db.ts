@@ -5,7 +5,7 @@
 import { randomBytes } from 'node:crypto';
 import { existsSync, rmSync } from 'node:fs';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import type { Claim, NoticeType, NoticeVia, Tool } from '../shared/protocol.ts';
+import type { Basis, Claim, NoticeType, NoticeVia, Tool } from '../shared/protocol.ts';
 import { claimError, MAX_CLAIMS, MAX_SUMMARY_CHARS } from '../shared/protocol.ts';
 
 export const SCHEMA_VERSION = 3;
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS notices (
   id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, sender_member_id TEXT NOT NULL, sender_session_id TEXT,
   type TEXT NOT NULL CHECK (type IN ('message', 'question', 'answer')), summary TEXT NOT NULL,
   claims TEXT NOT NULL DEFAULT '[]', to_names TEXT NOT NULL DEFAULT '[]', reply_to TEXT, client_id TEXT,
-  created_at TEXT NOT NULL, via TEXT,
+  created_at TEXT NOT NULL, via TEXT, basis TEXT,
   UNIQUE (sender_member_id, client_id)
 );
 CREATE INDEX IF NOT EXISTS notices_session ON notices(sender_session_id, created_at);
@@ -121,6 +121,8 @@ export interface Notice {
   created_at: string;
   /** 谁写的：AI 会话里发的，还是本人在终端里写的；旧连接器发的为 null。 */
   via: NoticeVia | null;
+  /** 回答的依据（本人确认、查证过、推测）；没写的、不是回答的为 null。 */
+  basis?: Basis | null;
 }
 /**
  * 送达时一次查出来的一条：通知本身，加上发送人的名字、回答对应的提问内容和提问时的会话，
@@ -233,19 +235,23 @@ export class Store {
   }
 
   /**
-   * 后来加的可空列（邀请码的过期时间、给哪个成员加设备）：只加列，结构版本不变，上一版的服务器照样能打开这个库（降级不受影响）。
+   * 后来加的可空列（邀请码的过期时间、给哪个成员加设备，回答的依据 basis）：只加列，结构版本不变，
+   * 上一版的服务器照样能打开这个库（降级不受影响，它不读也不写 basis）。
    * 没有过期时间、还没用的邀请码（这一版以前生成的）从现在起算 INVITE_DAYS 天。
    */
   private addColumns(): void {
     const missing = (['expires_at', 'member_id'] as const).filter((c) => !this.columns('invites').has(c));
+    const noBasis = !this.columns('notices').has('basis');
     const expires = this.now(INVITE_DAYS * DAY);
-    if (missing.length === 0) {
+    if (missing.length === 0 && !noBasis) {
       // 多数时候没有要补的：先只读地看一眼，不拿写锁
       if (!this.get('SELECT 1 AS x FROM invites WHERE expires_at IS NULL AND used_by IS NULL LIMIT 1')) return;
     }
     this.transaction(() => {
       const have = this.columns('invites');
       for (const c of missing) if (!have.has(c)) this.db.exec(`ALTER TABLE invites ADD COLUMN ${c} TEXT`);
+      // 几个进程同时打开时，拿到写锁以后再看一次：别人可能刚加过
+      if (!this.columns('notices').has('basis')) this.db.exec('ALTER TABLE notices ADD COLUMN basis TEXT');
       this.run('UPDATE invites SET expires_at = ? WHERE expires_at IS NULL AND used_by IS NULL', expires);
     });
   }
@@ -629,7 +635,7 @@ export class Store {
   /** 写入通知和它的收件人（调用方负责放进事务）。 */
   insertNotice(n: Notice, recipientIds: string[]): Notice {
     this.run(
-      'INSERT INTO notices (id, repo_id, sender_member_id, sender_session_id, type, summary, claims, to_names, reply_to, client_id, created_at, via) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO notices (id, repo_id, sender_member_id, sender_session_id, type, summary, claims, to_names, reply_to, client_id, created_at, via, basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       n.id,
       n.repo_id,
       n.sender_member_id,
@@ -642,6 +648,7 @@ export class Store {
       n.client_id,
       n.created_at,
       n.via,
+      n.basis ?? null,
     );
     for (const m of recipientIds) this.run('INSERT OR IGNORE INTO recipients (notice_id, member_id) VALUES (?, ?)', n.id, m);
     return n;

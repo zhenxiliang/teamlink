@@ -20,6 +20,43 @@ export const VIAS: NoticeVia[] = ['ai', 'person'];
 /** 本人写的那一条，渲染时跟在发送人名字后面。成员名里不能带它，免得冒充。 */
 export const PERSON_MARK = '（本人写的）';
 
+/**
+ * 回答的依据：confirmed 是回答方的用户亲口说的，checked 是回答方的 AI 在本机或系统里查到的，guess 是推测。
+ * AI 回答时必须写（命令行查），服务器只校验是不是这三个之一；本人在终端里写的回答不用写（本人写的就是最强的依据）。
+ * 渲染时跟在发送人后面；团队事实只收 confirmed、checked 和本人写的，推测不收。
+ */
+export type Basis = 'confirmed' | 'checked' | 'guess';
+export const BASES: Basis[] = ['confirmed', 'checked', 'guess'];
+export const BASIS_LABEL: Record<Basis, string> = { confirmed: '本人确认', checked: '查证过', guess: '推测' };
+/** 命令行里 --basis 认的写法（AI 照着自然语言写也能认出来）。 */
+const BASIS_WORDS: Record<Basis, string[]> = {
+  confirmed: ['confirmed', 'user', '本人确认', '确认', '用户说的', '用户确认', '本人说的'],
+  checked: ['checked', '查证过', '查过', '查证', '本机查到的', '查到的'],
+  guess: ['guess', '推测', '猜的', '猜测'],
+};
+
+/** --basis 的值认成哪一种；认不出返回 null。 */
+export function parseBasis(word: string): Basis | null {
+  const w = word.trim().toLowerCase();
+  return BASES.find((b) => BASIS_WORDS[b].includes(w)) ?? null;
+}
+
+/**
+ * 一条通知的结构化内容（送达和 --wait 的响应里带着，连接器存进 .team/notices.json）：
+ * teamlink fact --from 据此自动填来源和依据，沙箱里连不上服务器也能用。文字都是原文，没有规整过，用的时候自己规整。
+ */
+export interface NoticeItem {
+  id: string;
+  type: NoticeType;
+  sender: string;
+  via: NoticeVia | null;
+  basis: Basis | null;
+  summary: string;
+  /** 回答：回的是哪一条提问，和那条提问的内容。 */
+  replyTo: { id: string; question: string } | null;
+  createdAt: string;
+}
+
 export type ChangeType = 'added' | 'removed' | 'signature_changed' | 'behavior_changed';
 export const CHANGE_TYPES: ChangeType[] = ['added', 'removed', 'signature_changed', 'behavior_changed'];
 
@@ -140,6 +177,8 @@ export interface DeliveryResponse {
   hasMessages: boolean;
   /** 全部成员名（含自己），每次都带：会话中途有人加入时，命令行的名单下一次 hook 就更新。 */
   members?: string[];
+  /** 和 ids 一一对应的结构化内容（旧服务器不带）。 */
+  items?: NoticeItem[];
 }
 
 export interface Presence {
@@ -168,7 +207,15 @@ export interface TakeAnswersResponse {
   ids: string[];
   /** 被问的人现在在不在线：不在线了就不用再等。 */
   online: boolean;
+  /** 和 ids 一一对应的结构化内容（旧服务器不带）。 */
+  items?: NoticeItem[];
 }
+
+/**
+ * GET /api/v2/notice?repoId=…&id=…：查一条自己发的或者收到的通知（teamlink fact --from 在本机存档里找不到时用）。
+ * id 是自己发的提问时，返回它最新的一条回答（更正排在后面，以最新的为准）；还没有回答时 404。
+ */
+export type NoticeLookupResponse = NoticeItem;
 
 /** GET /api/v2/inbox?repoId=…[&all=1]：只看，不记送达，不受注入预算限制。默认看还没交给过 AI 会话的，all=1 看最近 7 天的全部。 */
 export interface InboxResponse {
