@@ -129,7 +129,7 @@ export interface FactInput {
   body?: string;
   /** 从哪条消息记的（回答或者消息）。 */
   from?: NoticeItem | null;
-  /** 显式写的依据；不写就用 from 的（本人写的、回答时的依据）。 */
+  /** 记录的人自己的依据：不带 from、或者 from 没写依据时才用得上；from 自己带着依据的以它为准，写得不一样会报错。 */
   basis?: Basis;
   /** 记录人（本机的成员名）。 */
   recorder: string;
@@ -141,11 +141,11 @@ export interface Recorded {
   fact: Fact;
 }
 
-/** 这条消息算不算本人写的、回答时写了什么依据。 */
-function basisOf(input: FactInput): FactBasis | null {
-  if (input.basis) return input.basis;
-  if (input.from?.via === 'person' && input.from.basis !== 'guess') return 'person';
-  return input.from?.basis ?? null;
+/** 那条消息自己的依据：本人写的（没说是推测），或者回答时写的；没写的（对方 AI 发的消息、旧连接器的回答）为 null。 */
+function sourceBasis(from: NoticeItem | null): FactBasis | null {
+  if (!from) return null;
+  if (from.via === 'person' && from.basis !== 'guess') return 'person';
+  return from.basis ?? null;
 }
 
 /** 记一条团队事实，返回做了什么。内容不合规矩时抛错，文件不动。 */
@@ -160,27 +160,42 @@ export function recordFact(root: string, input: FactInput): Recorded {
   const length = [...body].length;
   if (length > MAX_FACT_CHARS) throw new Error(`事实最多 ${MAX_FACT_CHARS} 字，这条有 ${length} 字：只写结论，来龙去脉留在代码和提交说明里`);
 
-  const basis = basisOf(input);
-  if (basis === 'guess') throw new Error('推测不进团队事实：先找对方本人确认，或者自己查证以后再记（加 --basis 本人确认 或 查证过）');
+  // 文件里的“依据”和“来源”说的必须是同一回事，所以带 --from 时两样都以那条消息为准：
+  // - 它是推测：不能当出处。否则“大概是 8 小时”加一个 --basis 本人确认，记下来就成了“阿明本人确认”；
+  // - 它自己带着依据：--basis 改不了（写得一样可以）；
+  // - 它没写依据、记录的人写了 --basis：担保的是记录的人，来源写记录的人，那条消息只作参照。
+  const fromId = from ? normalizeText(from.id, true) : '';
+  const own = sourceBasis(from);
+  const direct = '不带 --from，把事实写在主题后面再加 --basis';
+  if (own === 'guess') throw new Error(`推测不进团队事实：${fromId} 是对方的推测，不能当出处。请对方本人确认以后再答一次；你自己查证过、你的用户确认过的，${direct}`);
+  if (input.basis === 'guess') throw new Error('推测不进团队事实：先找本人确认，或者自己查证以后再记');
+  if (own && input.basis && input.basis !== own) {
+    throw new Error(`${fromId} 自己带着依据（${FACT_BASIS_LABEL[own]}），记下来的依据和来源都以它为准：去掉 --basis 再记。你另外查证过、你的用户另外确认过的，${direct}`);
+  }
+  const basis = own ?? input.basis ?? null;
   if (!basis) throw new Error(`不知道依据：加 --basis 本人确认（你的用户亲口说的）或 查证过（你在本机或系统里查到的）${from ? `。${from.id} 回答时没写依据` : ''}`);
 
   const reasons = reviewFact([title, body]);
   if (reasons.length > 0) throw new Error(`没有记：里面有${reasons.join('、')}。团队事实会提交进仓库、之后每个 AI 都会读，这类内容不能放进去`);
 
   const now = input.now ?? new Date();
-  const source = from
-    ? [
-        normalizeText(from.sender, true),
-        from.createdAt.slice(0, 10),
-        from.type === 'answer' && from.replyTo
-          ? `回答提问${from.replyTo.question ? `「${excerpt(from.replyTo.question, 30)}」` : ''}（${normalizeText(from.replyTo.id, true)}）`
-          : `消息（${normalizeText(from.id, true)}）`,
-      ].join('，')
-    : `${normalizeText(input.recorder, true)}，${today(now)}`;
+  const recorded = `${normalizeText(input.recorder, true)}，${today(now)}`;
+  let source = recorded;
+  if (from && own) {
+    source = [
+      normalizeText(from.sender, true),
+      from.createdAt.slice(0, 10),
+      from.type === 'answer' && from.replyTo
+        ? `回答提问${from.replyTo.question ? `「${excerpt(from.replyTo.question, 30)}」` : ''}（${normalizeText(from.replyTo.id, true)}）`
+        : `消息（${fromId}）`,
+    ].join('，');
+  } else if (from) {
+    source = `${recorded}，参照${normalizeText(from.sender, true)}没写依据的${from.type === 'answer' ? '回答' : '消息'}（${fromId}）`;
+  }
   const dir = join(root, FACTS_DIR);
   const file = `${FACTS_DIR}/${factFileName(title)}.md`;
   const path = join(root, file);
-  const next: Omit<Fact, 'file'> = { title, body, basis: FACT_BASIS_LABEL[basis], source, recorded: `${normalizeText(input.recorder, true)}，${today(now)}`, history: [] };
+  const next: Omit<Fact, 'file'> = { title, body, basis: FACT_BASIS_LABEL[basis], source, recorded, history: [] };
 
   let action: Recorded['action'] = 'created';
   if (existsSync(path)) {
@@ -221,12 +236,22 @@ function titleMatch(f: Fact, question: Set<string>): number {
   return t.size >= 2 ? coverage(t, question) : 0;
 }
 
-/** ask 之前查：主题几乎都出现在问题里的团队事实，最像的在前，最多 3 条。 */
-export function relatedFacts(root: string, question: string, threshold = 0.75): Fact[] {
+/** ask 之前拦下提问的两个条件：主题的特征至少这么多出现在问题里，而且问题的特征至少这么多是主题里的。 */
+export const ASK_TITLE_IN_QUESTION = 0.75;
+export const ASK_QUESTION_ABOUT_TITLE = 0.4;
+
+/**
+ * ask 之前查：问的就是某条团队事实的主题时，把它拦下来。最像的在前，最多 3 条。
+ * 两个条件都要满足：主题几乎都出现在问题里，而且问题里说的主要就是这个主题。只看前一条会乱拦：
+ * 有一条“下单限额”，“你那边下单限额的接口改完了吗”“用户说下单限额要改成按子账户算，你同意吗”就都发不出去，
+ * 而问进度、问对方的决定正是该问的。问题里别的内容一多就放行：漏了顶多多问一次，拦错了会挡住该问的问题。
+ */
+export function relatedFacts(root: string, question: string): Fact[] {
   const q = grams(question);
   return loadFacts(root)
-    .map((f) => ({ f, score: titleMatch(f, q) }))
-    .filter((x) => x.score >= threshold)
+    .map((f) => ({ f, t: grams(f.title) }))
+    .filter(({ f, t }) => titleMatch(f, q) >= ASK_TITLE_IN_QUESTION && coverage(q, t) >= ASK_QUESTION_ABOUT_TITLE)
+    .map(({ f, t }) => ({ f, score: similarity(t, q) }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 3)
     .map((x) => x.f);

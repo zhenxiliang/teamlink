@@ -9,7 +9,7 @@ import { createServer as createTlsServer } from 'node:https';
 import type { TLSSocket } from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { verifyRequest } from '../shared/crypto.ts';
-import { DEVICE_UNKNOWN, PROTOCOL, PROTOCOL_HEADER, TOOLS, type LegacyInboxResponse, type Tool } from '../shared/protocol.ts';
+import { DEVICE_UNKNOWN, FEATURES_BASIS, FEATURES_HEADER, PROTOCOL, PROTOCOL_HEADER, TOOLS, type LegacyInboxResponse, type Tool } from '../shared/protocol.ts';
 import type { DeviceRow, MemberRow } from './db.ts';
 import { ApiError, type Engine } from './engine.ts';
 
@@ -21,6 +21,8 @@ interface Ctx {
   device: DeviceRow;
   body: Record<string, unknown>;
   query: URLSearchParams;
+  /** 这个连接器认不认得 reply --basis 和 teamlink fact（按它报的功能版本）：不认得的，注入里按 0.2 的写法提示。 */
+  basisHints: boolean;
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -166,11 +168,11 @@ export function createApi(engine: Engine, tls?: TlsMaterial): Server {
 
     'GET /api/v2/repos': () => store.repos().map(({ id, url }) => ({ id, url })),
 
-    'POST /api/v2/sessions/start': ({ member, body }) => engine.deliver(member, { ...sessionOf(body), kind: 'start' }),
+    'POST /api/v2/sessions/start': ({ member, body, basisHints }) => engine.deliver(member, { ...sessionOf(body), kind: 'start', basisHints }),
 
-    'POST /api/v2/activity': ({ member, body }) => engine.deliver(member, { ...sessionOf(body), kind: 'activity' }),
+    'POST /api/v2/activity': ({ member, body, basisHints }) => engine.deliver(member, { ...sessionOf(body), kind: 'activity', basisHints }),
 
-    'POST /api/v2/sessions/stop-check': ({ member, body }) => engine.deliver(member, { ...sessionOf(body), kind: 'stop' }),
+    'POST /api/v2/sessions/stop-check': ({ member, body, basisHints }) => engine.deliver(member, { ...sessionOf(body), kind: 'stop', basisHints }),
 
     'POST /api/v2/acks': ({ member, body }) => {
       engine.ack(member, acksOf(body.acks));
@@ -198,12 +200,12 @@ export function createApi(engine: Engine, tls?: TlsMaterial): Server {
         basis: body.basis,
       }),
 
-    'POST /api/v2/answers/take': ({ member, body }) =>
-      engine.takeAnswers(member, { repoId: str(body.repoId, 'repoId'), question: str(body.question, 'question') }),
+    'POST /api/v2/answers/take': ({ member, body, basisHints }) =>
+      engine.takeAnswers(member, { repoId: str(body.repoId, 'repoId'), question: str(body.question, 'question'), basisHints }),
 
     'GET /api/v2/notice': ({ member, query }) => engine.lookup(member, str(query.get('repoId'), 'repoId'), str(query.get('id'), 'id')),
 
-    'GET /api/v2/inbox': ({ member, query }) => engine.inbox(member, str(query.get('repoId'), 'repoId'), ['1', 'true'].includes(query.get('all') ?? '')),
+    'GET /api/v2/inbox': ({ member, query, basisHints }) => engine.inbox(member, str(query.get('repoId'), 'repoId'), ['1', 'true'].includes(query.get('all') ?? ''), basisHints),
   };
 
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
@@ -261,7 +263,9 @@ export function createApi(engine: Engine, tls?: TlsMaterial): Server {
       const body = raw ? (JSON.parse(raw) as unknown) : {};
       if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ApiError(400, '请求体必须是 JSON 对象');
       // 送达类接口在这里同步地选条目、记送达，然后才写响应：中间没有 await
-      send(res, 200, handler({ member, device, body: body as Record<string, unknown>, query: url.searchParams }));
+      // 功能版本头只影响注入里的命令写法（不在签名里也无妨）：没带、不是数字的都当 0.2
+      const basisHints = Number(req.headers[FEATURES_HEADER]) >= FEATURES_BASIS;
+      send(res, 200, handler({ member, device, body: body as Record<string, unknown>, query: url.searchParams, basisHints }));
     } catch (e) {
       const status = e instanceof ApiError ? e.status : e instanceof SyntaxError ? 400 : 500;
       if (status === 500) engine.event('server_error', { path: url.pathname, error: e instanceof Error ? (e.stack ?? e.message) : String(e) });

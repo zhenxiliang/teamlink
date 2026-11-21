@@ -30,6 +30,29 @@ test('依据：AI 回答必须带 --basis，服务器存下来，提问方看到
   assert.equal(engine.store.notice(latestNotice().id)?.basis, null, '消息带了依据也不存');
 });
 
+test('新旧混用：没报功能版本的连接器（0.2）收到的还是 0.2 的写法，不提它不认得的 --basis 和 teamlink fact；报了的照常；依据两边都看得到', async () => {
+  fresh();
+  const { alice, bob } = devs;
+  await as(alice, 'ask', 'bob', '撤单接口的超时是多少秒？');
+  const qid = latestNotice().id;
+  // helpers 的 signed 只带协议版本头，不带功能版本头：就是 0.2 的连接器发来的请求
+  const inbox = `/api/v2/inbox?${new URLSearchParams({ repoId })}`;
+  const old = (await signed(bob, 'GET', inbox)).body.text as string;
+  assert.ok(old.includes(`    回答：teamlink reply ${qid} "…"（只有你的用户知道的，先在对话里问他；写明依据：用户说的、本机查到的，还是你的推测）`), old);
+  assert.doesNotMatch(old, /--basis/);
+  assert.ok((await as(bob, 'inbox')).includes(`    回答：teamlink reply ${qid} "…" --basis 本人确认|查证过|推测（`));
+
+  await as(bob, 'reply', qid, '5 秒', '--basis', '查证过');
+  const peek = (await signed(alice, 'GET', inbox)).body.text as string;
+  assert.match(peek, /回答 · 来自 bob · 依据：查证过 · /);
+  assert.doesNotMatch(peek, /teamlink fact/);
+  assert.match(await as(alice, 'inbox'), /\n {4}是长期有效的事实（限额、口径、约定这类）就记下来：teamlink fact "主题" --from n_/);
+  // hook 的送达接口也一样
+  const viaHook = (await signed(alice, 'POST', '/api/v2/activity', { repoId, tool: 'claude', sessionId: 'old-connector', acks: [] })).body;
+  assert.match(viaHook.text, /回答 · 来自 bob · 依据：查证过 · /);
+  assert.doesNotMatch(viaHook.text, /teamlink fact|--basis/);
+});
+
 test('团队事实：回答到了，提问方 fact --from 提问号（或回答号）就能记下，来源和依据自动带上；facts 能查；再问同样的问题先不发，--anyway 照发', async () => {
   fresh();
   const { alice, bob, carol } = devs;

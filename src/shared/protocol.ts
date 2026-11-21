@@ -5,6 +5,17 @@
 export const PROTOCOL = 2;
 export const PROTOCOL_HEADER = 'x-teamlink-protocol';
 
+/**
+ * 连接器的功能版本，每个请求都带在 FEATURES_HEADER 里。和 PROTOCOL 不一样：PROTOCOL 对不上就不能收发；
+ * 功能版本对不上照常收发，服务器只据此决定注入里附哪一版的命令写法——提示是服务器渲染的，
+ * 写了连接器不认得的命令，AI 照着做就会出错（0.2 的 reply 会把 --basis 当成回答的正文，也没有 fact 命令）。
+ * 没带这个头的是 0.2 的连接器，算 0。1（0.3）：认得 reply --basis、fact、facts。
+ */
+export const FEATURES = 1;
+export const FEATURES_HEADER = 'x-teamlink-features';
+/** 认得 reply --basis 和 teamlink fact 的最低功能版本。 */
+export const FEATURES_BASIS = 1;
+
 export type Tool = 'claude' | 'codex';
 export const TOOLS: Tool[] = ['claude', 'codex'];
 

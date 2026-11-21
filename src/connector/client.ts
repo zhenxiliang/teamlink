@@ -1,8 +1,8 @@
-// 带设备签名的 HTTP 客户端。每个请求都带协议版本头；响应里没有协议版本的，说明对面不是这一版的服务器。
+// 带设备签名的 HTTP 客户端。每个请求都带协议版本头和功能版本头；响应里没有协议版本的，说明对面不是这一版的服务器。
 
 import { randomBytes } from 'node:crypto';
 import { signRequest } from '../shared/crypto.ts';
-import { PROTOCOL, PROTOCOL_HEADER } from '../shared/protocol.ts';
+import { FEATURES, FEATURES_HEADER, PROTOCOL, PROTOCOL_HEADER } from '../shared/protocol.ts';
 import type { Identity } from './config.ts';
 
 /** 服务器回了错误（状态码不是 2xx），或者回的不是这一版的协议。status 是 HTTP 状态码。 */
@@ -32,7 +32,7 @@ export async function call<T>(server: string, identity: Identity | null, method:
   // Codex 并行的几条 hook 在同一毫秒发出同样的请求时签名完全相同，后到的会被当成重放
   const sent = identity && method === 'POST' && body && typeof body === 'object' && !Array.isArray(body) ? { ...body, nonce: randomBytes(8).toString('hex') } : body;
   const raw = sent === undefined ? '' : JSON.stringify(sent);
-  const headers: Record<string, string> = { 'content-type': 'application/json', [PROTOCOL_HEADER]: String(PROTOCOL) };
+  const headers: Record<string, string> = { 'content-type': 'application/json', [PROTOCOL_HEADER]: String(PROTOCOL), [FEATURES_HEADER]: String(FEATURES) };
   if (identity) {
     const ts = String(Date.now());
     headers['x-tl-device'] = identity.deviceId;

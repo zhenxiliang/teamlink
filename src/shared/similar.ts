@@ -25,7 +25,7 @@ export function grams(text: string): Set<string> {
   return out;
 }
 
-/** a 的特征有多大比例也在 b 里（0 到 1）：a 是短的那个（事实的主题），b 是长的那个（提问）。a 没有特征时为 0。 */
+/** a 的特征有多大比例也在 b 里（0 到 1）。ask 之前查重两个方向都算：主题有多少在提问里，提问有多少是主题里的。a 没有特征时为 0。 */
 export function coverage(a: Set<string>, b: Set<string>): number {
   if (a.size === 0) return 0;
   let n = 0;

@@ -95,6 +95,8 @@ export class ApiError extends Error {
 /** 送达类请求：开工、prompt 和 post-tool、收尾检查。 */
 export interface DeliverInput extends SessionRef {
   kind: 'start' | 'activity' | 'stop';
+  /** 连接器认不认得 reply --basis 和 teamlink fact（接口层按功能版本头算）：决定注入里附哪一版的写法。不写当作认得。 */
+  basisHints?: boolean;
 }
 
 /** 发消息的输入（接口层只做类型上的整理，规则都在这里查）。 */
@@ -391,6 +393,7 @@ export class Engine {
         start,
         budgetBytes: this.config.budgetBytes,
         now: this.store.clock(),
+        basisHints: p.basisHints,
       });
       // 只把放进去的记成已交出，其余继续排队。旧连接器不回确认：当场算送到
       const sent = pending.slice(0, batch.included);
@@ -428,7 +431,7 @@ export class Engine {
    * 响应丢了、命令在打印前被杀了，下一次轮询还能再拿到，一直没确认的由 hook 重发。
    * 只拿没交出去过的和上次 --wait 拿走还没确认的：已经交给 hook 的那一份由 hook 负责。提问必须是这个成员自己发的。
    */
-  takeAnswers(member: MemberRow, p: { repoId: string; question: string }): TakeAnswersResponse {
+  takeAnswers(member: MemberRow, p: { repoId: string; question: string; basisHints?: boolean }): TakeAnswersResponse {
     this.requireRepo(p.repoId);
     const q = this.store.notice(p.question);
     if (!q || q.repo_id !== p.repoId || q.type !== 'question') throw new ApiError(404, `找不到提问 ${normalizeText(p.question, true).slice(0, 40)}`);
@@ -440,7 +443,7 @@ export class Engine {
       for (const n of answers) this.store.handOut(n.id, member.id, WAIT_SESSION, false);
       const asked = this.store.recipientIds(q.id);
       return {
-        text: answers.length > 0 ? renderBatch({ items: answers.map(toItem), budgetBytes: Infinity, now: this.store.clock() }).text : '',
+        text: answers.length > 0 ? renderBatch({ items: answers.map(toItem), budgetBytes: Infinity, now: this.store.clock(), basisHints: p.basisHints }).text : '',
         ids: answers.map((n) => n.id),
         online: asked.some((id) => this.presence(id, p.repoId).online),
         items: answers.map(toNoticeItem),
@@ -634,11 +637,11 @@ export class Engine {
    * teamlink inbox：只看，不记送达，不受注入预算限制。默认看还没交给过 AI 会话的
    * （交出去了、还在等确认的不算：多半已经在 AI 手里，没到的会自动重发），all 看最近 7 天的全部。
    */
-  inbox(member: MemberRow, repoId: string, all: boolean): InboxResponse {
+  inbox(member: MemberRow, repoId: string, all: boolean, basisHints = true): InboxResponse {
     this.requireRepo(repoId);
     const rows = all ? this.store.received(member.id, repoId, this.store.now(-INBOX_WINDOW_MS)) : this.store.pending(member.id, repoId).filter((n) => n.delivered_at === null);
     if (rows.length === 0) return { text: all ? '最近 7 天没有收到消息。' : '没有还没送到的消息。', count: 0 };
-    return { text: renderBatch({ items: rows.map(toItem), budgetBytes: Infinity, now: this.store.clock() }).text, count: rows.length };
+    return { text: renderBatch({ items: rows.map(toItem), budgetBytes: Infinity, now: this.store.clock(), basisHints }).text, count: rows.length };
   }
 
   // —— 备份 ——

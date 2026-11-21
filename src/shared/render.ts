@@ -74,6 +74,8 @@ export function factWorthy(item: Pick<RenderItem, 'type' | 'via' | 'basis'>): bo
 
 /** 回答提问时的写法提示（注入里每条提问下面一行，AGENTS.md 里也是这个写法）。 */
 export const REPLY_HINT = '--basis 本人确认|查证过|推测';
+/** 给 0.2 的连接器的写法：它的 reply 不认得 --basis（会当成回答的正文），依据照旧写在回答里。 */
+const REPLY_HINT_OLD = '（只有你的用户知道的，先在对话里问他；写明依据：用户说的、本机查到的，还是你的推测）';
 
 const chars = (s: string) => [...s];
 
@@ -91,20 +93,20 @@ function claimsLine(claims: Claim[], shown: number): string {
 }
 
 /** 渲染一条：提问、回答、消息。shownClaims 用来在单条超预算时截短声明。 */
-export function renderEntry(item: RenderItem, index: number, shownClaims = item.claims.length): string {
+export function renderEntry(item: RenderItem, index: number, shownClaims = item.claims.length, basisHints = true): string {
   // 默认是对方的 AI 发的；本人在终端里亲手写的标出来：这一条是他本人的话，不是他的 AI 的推断
   const sender = `${normalizeText(item.sender, true)}${item.via === 'person' ? PERSON_MARK : ''}`;
   const id = normalizeText(item.id, true);
   const summary = normalizeText(item.summary);
   const claims = item.claims.length > 0 ? [claimsLine(item.claims, shownClaims)] : [];
   const basis = item.basis && BASIS_LABEL[item.basis] ? ` · 依据：${BASIS_LABEL[item.basis]}` : '';
-  const fact = factWorthy(item) ? [`    是长期有效的事实（限额、口径、约定这类）就记下来：teamlink fact "主题" --from ${id}`] : [];
+  const fact = basisHints && factWorthy(item) ? [`    是长期有效的事实（限额、口径、约定这类）就记下来：teamlink fact "主题" --from ${id}`] : [];
   switch (item.type) {
     case 'question':
       return [
         `[${index}] 提问 · 来自 ${sender} · ${id}：${summary}`,
         ...claims,
-        `    回答：teamlink reply ${id} "…" ${REPLY_HINT}（只有你的用户知道的，先在对话里问他，不要替他猜）`,
+        basisHints ? `    回答：teamlink reply ${id} "…" ${REPLY_HINT}（只有你的用户知道的，先在对话里问他，不要替他猜）` : `    回答：teamlink reply ${id} "…"${REPLY_HINT_OLD}`,
       ].join('\n');
     case 'answer': {
       const q = item.replyTo;
@@ -168,6 +170,11 @@ export interface BatchInput {
   now: number;
   /** 边界标签里的随机串（测试里可以固定）。 */
   nonce?: string;
+  /**
+   * 收件人的连接器认不认得 reply --basis 和 teamlink fact（0.3 起，见 FEATURES_BASIS）。不认得的按 0.2 的写法提示回答，
+   * 也不附“记进团队事实”那一行；回答的依据照样写出来。不写当作认得。
+   */
+  basisHints?: boolean;
 }
 
 export interface Batch {
@@ -190,6 +197,7 @@ export function renderBatch(input: BatchInput): Batch {
   const teammates = input.teammates ?? [];
   const others = input.others ?? [];
   const budget = input.budgetBytes ?? INJECTION_BUDGET_BYTES;
+  const hints = input.basisHints ?? true;
   if (items.length === 0 && teammates.length === 0 && others.length === 0) return { text: input.start ? CONNECTED_TEXT : '', messagesText: '', included: 0 };
   const tag = `team-notices-${input.nonce ?? randomBytes(4).toString('hex')}`;
   const team = renderTeammates(teammates, now, others);
@@ -201,12 +209,12 @@ export function renderBatch(input: BatchInput): Batch {
   const entries: string[] = [];
   for (let i = 0; i < items.length; i++) {
     const rest = items.length - i - 1;
-    let entry = renderEntry(items[i], i + 1);
+    let entry = renderEntry(items[i], i + 1, undefined, hints);
     if (!fits([...entries, entry], rest)) {
       if (i > 0) break;
       // 第一条自己就超了：声明从后往前截，至少留一处，其余写成“等 N 处”
       for (let k = items[i].claims.length - 1; k >= 1; k--) {
-        entry = renderEntry(items[i], i + 1, k);
+        entry = renderEntry(items[i], i + 1, k, hints);
         if (fits([entry], rest)) break;
       }
     }
